@@ -4,7 +4,6 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python douyin_nowm_web.py
-    plan: free
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
+      - key: PORT
+        value: 10000

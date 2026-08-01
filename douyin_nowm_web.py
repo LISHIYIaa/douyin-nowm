@@ -1056,6 +1056,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Not Found")
 
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/parse":
@@ -1080,6 +1088,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
+        # SCF 网关默认会加 Content-Disposition: attachment，覆盖为 inline
+        self.send_header("Content-Disposition", "inline")
+        # 增加跨域头，防止部分浏览器/网关触发 CORS 拦截
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
