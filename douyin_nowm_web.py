@@ -838,7 +838,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音分享链接..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴抖音/小红书分享链接或完整分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
