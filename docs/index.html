@@ -362,7 +362,7 @@
       <div class="logo-icon">🎬</div>
       <span>去水印下载</span>
     </div>
-    <p class="subtitle">抖音 / 小红书 · 粘贴链接，一键获取无水印原视频/原图</p>
+    <p class="subtitle">抖音 / 小红书 · 粘贴链接或分享文本，一键获取无水印原视频/原图</p>
     <button class="btn-settings" onclick="toggleSettings()">⚙️ 设置</button>
   </div>
 
@@ -388,7 +388,7 @@
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音分享链接..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴分享链接或分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
@@ -453,9 +453,10 @@ const qualityRow = document.getElementById('quality-row');
 
 urlInput.addEventListener('input', () => {
   const v = urlInput.value.trim().toLowerCase();
+  // 自动检测平台
   if (v.includes('xiaohongshu') || v.includes('xhslink') || v.includes('xhs.cn')) {
     if (platform !== 'xhs') setPlatform('xhs');
-  } else if (v.includes('douyin') || v.includes('iesdouyin')) {
+  } else if (v.includes('douyin') || v.includes('iesdouyin') || v.includes('v.douyin')) {
     if (platform !== 'douyin') setPlatform('douyin');
   }
 });
@@ -469,12 +470,12 @@ function setPlatform(p) {
   if (p === 'xhs') tab.classList.add('xhs');
 
   if (p === 'xhs') {
-    urlInput.placeholder = '粘贴小红书分享链接...';
+    urlInput.placeholder = '粘贴小红书分享链接或分享文本...';
     btnParse.classList.add('xhs');
     urlInput.classList.add('xhs');
     qualityRow.classList.add('disabled');
   } else {
-    urlInput.placeholder = '粘贴抖音分享链接...';
+    urlInput.placeholder = '粘贴抖音分享链接或分享文本...';
     btnParse.classList.remove('xhs');
     urlInput.classList.remove('xhs');
     qualityRow.classList.remove('disabled');
@@ -526,7 +527,7 @@ async function parseLink() {
     const resp = await fetch(getApiBase() + '/api/parse', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, quality, platform })
+      body: JSON.stringify({ url, quality })
     });
     const data = await resp.json();
 
@@ -563,6 +564,7 @@ async function parseLink() {
       });
 
       const totalFilename = (data.author + '_' + (data.pub_date || '') + '_全部图片.zip').replace(/[\\/:*?"<>|#]/g, '_');
+      const xsecToken = data.xsec_token || '';
 
       resultArea.innerHTML = `
         <div class="result-card">
@@ -595,7 +597,7 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">共 ${data.images.length} 张 · ${data.file_size_human}</div>
               </div>
-              <a class="btn-download" href="${getApiBase()}/api/download_zip?note_id=${data.video_id}&author=${encodeURIComponent(data.author)}&pub_date=${encodeURIComponent(data.pub_date||'')}" target="_blank">
+              <a class="btn-download" href="${getApiBase()}/api/download_zip?note_id=${data.video_id}&author=${encodeURIComponent(data.author)}&pub_date=${encodeURIComponent(data.pub_date||'')}&xsec_token=${encodeURIComponent(xsecToken)}" target="_blank">
                 ⬇ 打包下载
               </a>
             </div>

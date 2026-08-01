@@ -88,12 +88,21 @@ def _proxy_download(dl_url, filename, platform="douyin"):
     )
 
 
-def _proxy_download_zip(note_id, author, pub_date):
-    """重新获取小红书笔记并打包图片"""
+def _proxy_download_zip(note_id, author, pub_date, xsec_token="", xsec_source="pc_feed"):
+    """重新获取小红书笔记并打包图片（需要 xsec_token 才能获取笔记数据）"""
     try:
+        # 构造带 xsec_token 的完整 URL
         page_url = f"https://www.xiaohongshu.com/explore/{note_id}"
+        if xsec_token:
+            page_url += f"?xsec_token={urllib.parse.quote(xsec_token)}&xsec_source={xsec_source}"
         html = xhs_fetch_page_html(page_url)
         state = xhs_parse_initial_state(html)
+
+        # 检查 noteDetailMap 是否有数据
+        note_map = state.get("note", {}).get("noteDetailMap", {})
+        if not note_map:
+            return _resp(400, json.dumps({"ok": False, "error": "笔记数据获取失败，链接中的 xsec_token 可能已过期，请重新解析后再下载"}, ensure_ascii=False), "application/json")
+
         info = xhs_extract_note_info(state, note_id)
 
         if info["note_type"] != "image":
@@ -180,8 +189,10 @@ def main_handler(event, context):
         note_id = query.get("note_id", "")
         author = query.get("author", "author")
         pub_date = query.get("pub_date", "")
+        xsec_token = query.get("xsec_token", "")
+        xsec_source = query.get("xsec_source", "pc_feed")
         if not note_id:
             return _resp(400, json.dumps({"ok": False, "error": "缺少 note_id 参数"}, ensure_ascii=False), "application/json")
-        return _proxy_download_zip(note_id, author, pub_date)
+        return _proxy_download_zip(note_id, author, pub_date, xsec_token, xsec_source)
 
     return _resp(404, json.dumps({"ok": False, "error": "Not Found"}, ensure_ascii=False), "application/json")
