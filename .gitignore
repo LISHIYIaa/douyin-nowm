@@ -1,0 +1,7 @@
+*.mp4
+*.jpg
+*.zip
+__pycache__/
+.DS_Store
+.workbuddy/
+*.pyc
