@@ -1030,6 +1030,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/" or parsed.path == "/index.html":
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            # SCF 网关默认会加 Content-Disposition: attachment，覆盖为 inline
+            self.send_header("Content-Disposition", "inline")
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode("utf-8"))
 
