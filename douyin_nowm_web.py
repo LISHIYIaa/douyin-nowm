@@ -85,20 +85,141 @@ def detect_platform(url: str) -> str:
 
 # ── 抖音核心逻辑 ──────────────────────────────────────
 
-def dy_resolve_share_url(share_url: str) -> str:
+def dy_resolve_share_url(share_url: str) -> tuple[str, str]:
+    """解析分享链接，返回 (最终URL, 视频ID)。"""
     if "v.douyin.com" in share_url:
         req = urllib.request.Request(share_url, headers={"User-Agent": MOBILE_UA})
         resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=15)
-        return resp.geturl()
-    match = re.search(r"/video/(\d+)", share_url)
-    if match:
-        vid = match.group(1)
-        return f"https://www.iesdouyin.com/share/video/{vid}/"
-    if "iesdouyin.com/share/video" in share_url:
-        return share_url
+        final_url = resp.geturl()
+        vid = _dy_extract_video_id(final_url)
+        return final_url, vid
+    vid = _dy_extract_video_id(share_url)
+    if vid:
+        if "iesdouyin.com" not in share_url and "douyin.com" not in share_url:
+            return f"https://www.iesdouyin.com/share/video/{vid}/", vid
+        return share_url, vid
     req = urllib.request.Request(share_url, headers={"User-Agent": MOBILE_UA})
     resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=15)
-    return resp.geturl()
+    final_url = resp.geturl()
+    vid = _dy_extract_video_id(final_url)
+    return final_url, vid
+
+
+def _dy_extract_video_id(url: str) -> str:
+    """从 URL 中提取视频 ID"""
+    match = re.search(r"/video/(\d+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"/share/video/(\d+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"modal_id=(\d{15,})", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"/(\d{15,})", url)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def dy_fetch_via_api(video_id: str) -> dict:
+    """通过抖音专用 API 获取视频/图集详情（推荐方式）。
+
+    接口: https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/?aweme_ids=[ID]
+    返回: aweme_details 列表，包含完整视频/图集数据。
+    图文笔记需要额外加 request_source=200 参数。
+    """
+    api_urls = [
+        f"https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/?aweme_ids=%5B{video_id}%5D",
+        f"https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/?aweme_ids=%5B{video_id}%5D&request_source=200",
+    ]
+    headers = {
+        "User-Agent": MOBILE_UA,
+        "Referer": DOUYIN_REFERER,
+    }
+    for api_url in api_urls:
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=15)
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if data and data.get("aweme_details"):
+                return data
+        except Exception:
+            continue
+    raise ValueError("抖音 API 未返回有效数据")
+
+
+def dy_extract_from_api(api_data: dict) -> dict:
+    """从 API 返回的 aweme_details 中提取视频信息。"""
+    details = api_data.get("aweme_details", [])
+    if not details:
+        raise ValueError("API 返回的 aweme_details 为空")
+    item = details[0]
+
+    video = item.get("video", {})
+    play_addr = video.get("play_addr", {})
+    uri = play_addr.get("uri", "")
+
+    # 判断是否为图文（有 images 字段且非空）
+    is_note = bool(item.get("images") and isinstance(item["images"], list) and len(item["images"]) > 0)
+
+    # 提取图片列表（图文模式）
+    images = []
+    if is_note:
+        for img in item["images"]:
+            url_list = img.get("url_list", [])
+            img_url = ""
+            # 优先取非 webp 格式
+            for u in url_list:
+                if u and not u.endswith(".webp"):
+                    img_url = u
+                    break
+            if not img_url and url_list:
+                img_url = url_list[0]
+            if img_url:
+                images.append({"url": img_url})
+
+    create_ts = item.get("create_time", 0)
+    try:
+        pub_date = datetime.fromtimestamp(create_ts).strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        pub_date = ""
+
+    result = {
+        "aweme_id": item.get("aweme_id", ""),
+        "desc": item.get("desc", ""),
+        "nickname": item.get("author", {}).get("nickname", ""),
+        "video_uri": uri,
+        "width": video.get("width", 0),
+        "height": video.get("height", 0),
+        "duration_ms": video.get("duration", 0),
+        "pub_date": pub_date,
+        "digg_count": item.get("statistics", {}).get("digg_count", 0),
+        "comment_count": item.get("statistics", {}).get("comment_count", 0),
+        "share_count": item.get("statistics", {}).get("share_count", 0),
+        "cover_url": "",
+        "is_note": is_note,
+        "note_images": images,
+    }
+
+    # 封面
+    cover = video.get("cover", {})
+    if isinstance(cover, dict):
+        cl = cover.get("url_list", [])
+        if cl:
+            result["cover_url"] = cl[0]
+
+    # 如果是图文，尝试从 play_addr 的 url_list 取无水印直链
+    if is_note:
+        url_list = play_addr.get("url_list", [])
+        if url_list:
+            result["download_url"] = url_list[0].replace("/playwm/", "/play/")
+    else:
+        # 视频：用 play_api 构建下载链接
+        if uri:
+            result["download_url"] = dy_build_download_url(uri)
+
+    return result
 
 
 def dy_fetch_page_html(url: str) -> str:
@@ -183,15 +304,78 @@ def dy_probe_url(url: str) -> dict:
 
 
 def process_douyin(share_url: str, quality: str = "default") -> dict:
-    page_url = dy_resolve_share_url(share_url)
-    html = dy_fetch_page_html(page_url)
-    router = dy_parse_router_data(html)
-    info = dy_extract_video_info(router)
-    dl_url = dy_build_download_url(info["video_uri"], quality)
+    # Step 1: 解析链接，获取视频 ID
+    page_url, video_id = dy_resolve_share_url(share_url)
+    if not video_id:
+        raise ValueError("无法从链接中提取抖音视频 ID")
+
+    info = None
+
+    # Step 2: 优先通过专用 API 获取（推荐，不依赖页面 HTML 结构）
+    try:
+        api_data = dy_fetch_via_api(video_id)
+        info = dy_extract_from_api(api_data)
+    except Exception as api_err:
+        api_error = str(api_err)
+        # Step 3: API 失败时降级到旧版 HTML 解析
+        try:
+            html = dy_fetch_page_html(page_url)
+            router = dy_parse_router_data(html)
+            old_info = dy_extract_video_info(router)
+            # 转换为统一格式
+            dl_url = dy_build_download_url(old_info["video_uri"], quality)
+            probe = dy_probe_url(dl_url)
+            info = {
+                "aweme_id": old_info["aweme_id"],
+                "desc": old_info["desc"],
+                "nickname": old_info["nickname"],
+                "video_uri": old_info["video_uri"],
+                "width": old_info["width"],
+                "height": old_info["height"],
+                "duration_ms": old_info["duration_ms"],
+                "pub_date": old_info["pub_date"],
+                "digg_count": old_info["digg_count"],
+                "comment_count": old_info["comment_count"],
+                "share_count": old_info["share_count"],
+                "cover_url": old_info["cover_url"],
+                "is_note": False,
+                "note_images": [],
+                "download_url": dl_url,
+            }
+        except Exception:
+            raise ValueError(f"抖音解析失败（API: {api_error}，HTML 解析也不可用）")
+
+    # Step 4: 构建返回结果
+    is_note = info.get("is_note", False)
+
+    if is_note:
+        # 图文模式
+        images = info.get("note_images", [])
+        dl_url = info.get("download_url", "")
+        return {
+            "platform": "douyin",
+            "ok": True,
+            "type": "note",
+            "video_id": info["aweme_id"],
+            "author": info["nickname"],
+            "desc": info["desc"],
+            "pub_date": info["pub_date"],
+            "images": images,
+            "image_count": len(images),
+            "digg_count": info["digg_count"],
+            "cover_url": info.get("cover_url", ""),
+        }
+
+    # 视频模式
+    if not info.get("download_url"):
+        dl_url = dy_build_download_url(info["video_uri"], quality)
+    else:
+        dl_url = info["download_url"]
     probe = dy_probe_url(dl_url)
     return {
         "platform": "douyin",
         "ok": True,
+        "type": "video",
         "video_id": info["aweme_id"],
         "author": info["nickname"],
         "desc": info["desc"],
