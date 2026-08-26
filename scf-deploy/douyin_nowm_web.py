@@ -1101,7 +1101,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音/小红书分享链接或完整分享文本..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书 / TikTok 分享链接或完整分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
@@ -1130,6 +1130,7 @@ const btnParse = document.getElementById('btn-parse');
 const resultArea = document.getElementById('result-area');
 const errorEl = document.getElementById('error-msg');
 const qualityRow = document.getElementById('quality-row');
+let currentRawUrl = '';  // 保存用户原始输入，供 TikTok 重新获取直链使用
 
 urlInput.addEventListener('input', () => {
   const v = urlInput.value.trim().toLowerCase();
@@ -1183,6 +1184,7 @@ function formatNum(n) {
 async function parseLink() {
   const url = urlInput.value.trim();
   if (!url) { showError('请输入视频链接'); return; }
+  currentRawUrl = url;  // 记录原始输入
 
   clearError();
   resultArea.innerHTML = '';
@@ -1314,7 +1316,7 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${isTikTok ? data.download_url : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}"${isTikTok ? ' download referrerpolicy="no-referrer" target="_blank"' : ''}>
+              <a class="btn-download" href="${isTikTok ? '#' : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}"${isTikTok ? ' onclick="return tiktokDownload(event)"' : ''}>
                 ⬇ ${isTikTok ? '浏览器下载' : '下载'}
               </a>
             </div>
@@ -1322,7 +1324,7 @@ async function parseLink() {
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
-            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 直链需在能访问 TikTok 的浏览器中下载。若点击后直接播放，请右键视频「另存为」，或复制链接用下载工具获取。</div>' : ''}
+            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 直链为限时签名地址，点击「浏览器下载」会实时重新获取最新链接。若你的网络无法访问 TikTok（如国内未开代理），浏览器将无法加载视频——此时请复制链接，在可访问 TikTok 的环境下载。</div>' : ''}
           </div>
         </div>`;
     }
@@ -1345,6 +1347,34 @@ function copyLink(btn) {
       btn.classList.remove('copied');
     }, 2000);
   });
+}
+
+// TikTok：点击时后端重新抓取最新直链（规避签名过期），再用浏览器打开
+async function tiktokDownload(e) {
+  e.preventDefault();
+  if (!currentRawUrl) return;
+  const btn = e.currentTarget;
+  const oldText = btn.textContent;
+  btn.textContent = '获取直链...';
+  btn.disabled = true;
+  try {
+    const resp = await fetch('/api/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: currentRawUrl })
+    });
+    const data = await resp.json();
+    if (!data.ok || !data.download_url) throw new Error(data.error || '获取直链失败');
+    const inp = document.getElementById('dl-url');
+    if (inp) inp.value = data.download_url;
+    const w = window.open(data.download_url, '_blank', 'noreferrer');
+    if (!w) throw new Error('浏览器拦截了弹窗，请允许弹窗后重试，或复制链接下载');
+  } catch (err) {
+    alert('获取直链失败：' + err.message + '\n\n请复制下方链接，用支持 TikTok 的下载工具或能访问 TikTok 的浏览器获取。');
+  } finally {
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
 }
 </script>
 </body>
