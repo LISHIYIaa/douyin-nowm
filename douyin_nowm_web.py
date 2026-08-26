@@ -74,13 +74,15 @@ def extract_url_from_text(text: str) -> str:
 # ── 平台检测 ──────────────────────────────────────────
 
 def detect_platform(url: str) -> str:
-    """根据 URL 判断平台：douyin / xhs"""
+    """根据 URL 判断平台：douyin / xhs / tiktok"""
     lower = url.lower()
     if any(k in lower for k in ["douyin.com", "iesdouyin.com", "v.douyin.com"]):
         return "douyin"
     if any(k in lower for k in ["xiaohongshu.com", "xhslink.com", "xhs.cn"]):
         return "xhs"
-    raise ValueError("无法识别链接平台，目前支持抖音和小红书")
+    if any(k in lower for k in ["tiktok.com", "tiktokcdn.com", "vm.tiktok.com", "vt.tiktok.com"]):
+        return "tiktok"
+    raise ValueError("无法识别链接平台，目前支持抖音、小红书和 TikTok")
 
 
 # ── 抖音核心逻辑 ──────────────────────────────────────
@@ -671,6 +673,81 @@ def process_xhs(share_url: str) -> dict:
 
 # ── 统一入口 ──────────────────────────────────────────
 
+TIKTOK_REFERER = "https://www.tiktok.com/"
+
+def tk_resolve_url(share_url: str) -> str:
+    """解析 TikTok 短链（vm.tiktok.com / vt.tiktok.com）到完整视频页 URL"""
+    lower = share_url.lower()
+    if "vm.tiktok.com" in lower or "vt.tiktok.com" in lower:
+        req = urllib.request.Request(share_url, headers={"User-Agent": DESKTOP_UA})
+        resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=15)
+        return resp.geturl()
+    return share_url
+
+def process_tiktok(share_url: str) -> dict:
+    """解析 TikTok 视频，提取官方无水印下载地址（downloadAddr）。
+
+    注意：TikTok 视频 CDN 有 Akamai 反爬，服务器端无法直接代理下载
+    （数据中心 IP 会被 403）。因此本函数只负责解析出无水印直链，
+    由前端用浏览器直接拉取（浏览器指纹可过 Akamai）。
+    """
+    page_url = tk_resolve_url(share_url)
+    req = urllib.request.Request(page_url, headers={
+        "User-Agent": DESKTOP_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": TIKTOK_REFERER,
+    })
+    html = urllib.request.urlopen(req, context=SSL_CTX, timeout=20).read().decode("utf-8", errors="replace")
+    # 还原 HTML 转义，便于正则提取
+    h = (html.replace("\\u002F", "/").replace("\\u0026", "&")
+             .replace("\\u003C", "<").replace("\\u003E", ">"))
+
+    da = re.search(r'"downloadAddr"\s*:\s*"(https://[^"]+)"', h)
+    if not da:
+        raise ValueError("未找到 TikTok 视频下载地址（可能视频已删除或链接无效）")
+    dl = da.group(1)
+
+    def grab(name, default=""):
+        m = re.search(r'"%s"\s*:\s*"([^"]*)"' % name, h)
+        return m.group(1) if m else default
+
+    def grabi(name, default=0):
+        m = re.search(r'"%s"\s*:\s*(\d+)' % name, h)
+        return int(m.group(1)) if m else default
+
+    author = grab("uniqueId") or grab("nickname") or "tiktok_user"
+    desc = grab("desc")
+    cover = grab("originCover") or grab("cover")
+    width = grabi("width")
+    height = grabi("height")
+    duration_s = grabi("duration")
+    digg = grabi("diggCount")
+    comment = grabi("commentCount")
+    share = grabi("shareCount")
+    collect = grabi("collectCount")
+
+    resolution = f"{width}x{height}" if width and height else "原画"
+    duration = f"{duration_s // 60:02d}:{duration_s % 60:02d}" if duration_s else ""
+
+    return {
+        "platform": "tiktok",
+        "ok": True,
+        "author": author,
+        "desc": desc,
+        "cover_url": cover,
+        "resolution": resolution,
+        "duration": duration,
+        "download_url": dl,
+        "file_size_human": "需浏览器下载",
+        "content_type": "video/mp4",
+        "digg_count": digg,
+        "comment_count": comment,
+        "share_count": share,
+        "collected_count": collect,
+        "client_download": True,  # 标记：浏览器直链下载，不走服务端代理
+    }
+
+
 def process_link(share_url: str, quality: str = "default") -> dict:
     # 自动从分享文本中提取 URL
     url = extract_url_from_text(share_url)
@@ -679,6 +756,8 @@ def process_link(share_url: str, quality: str = "default") -> dict:
         return process_douyin(url, quality)
     elif platform == "xhs":
         return process_xhs(url)
+    elif platform == "tiktok":
+        return process_tiktok(url)
     raise ValueError("不支持的平台")
 
 
@@ -703,7 +782,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>去水印 · 原视频/图片下载（抖音 / 小红书）</title>
+<title>去水印 · 原视频/图片下载（抖音 / 小红书 / TikTok）</title>
 <style>
   :root {
     --bg: #0f0f13;
@@ -1022,7 +1101,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音/小红书分享链接或完整分享文本..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书 / TikTok 分享链接或完整分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
@@ -1127,18 +1206,21 @@ async function parseLink() {
     if (!data.ok) throw new Error(data.error || '解析失败');
 
     const isXHS = data.platform === 'xhs';
-    const pClass = isXHS ? 'xhs' : 'douyin';
-    const pLabel = isXHS ? '小红书' : '抖音';
-    const pIcon = isXHS ? '📕' : '🎵';
+    const isTikTok = data.platform === 'tiktok';
+    const pClass = isXHS ? 'xhs' : (isTikTok ? 'tiktok' : 'douyin');
+    const pLabel = isXHS ? '小红书' : (isTikTok ? 'TikTok' : '抖音');
+    const pIcon = isXHS ? '📕' : (isTikTok ? '🎬' : '🎵');
     const isImage = data.note_type === 'image';
 
-    const badge = isXHS
-      ? (isImage
-        ? `<span style="color:var(--green)">● 原图高清</span>`
-        : `<span style="color:var(--green)">● 原始高清</span>`)
-      : (quality === 'default'
-        ? `<span style="color:var(--green)">● 原始高清</span>`
-        : `<span style="color:var(--text-dim)">● 720P 压缩</span>`);
+    const badge = isTikTok
+      ? `<span style="color:var(--green)">● TikTok 无水印原画</span>`
+      : (isXHS
+        ? (isImage
+          ? `<span style="color:var(--green)">● 原图高清</span>`
+          : `<span style="color:var(--green)">● 原始高清</span>`)
+        : (quality === 'default'
+          ? `<span style="color:var(--green)">● 原始高清</span>`
+          : `<span style="color:var(--text-dim)">● 720P 压缩</span>`));
 
     if (isImage) {
       // 图文笔记：显示图片画廊
@@ -1232,14 +1314,15 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}">
-                ⬇ 下载
+              <a class="btn-download" href="${isTikTok ? data.download_url : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}"${isTikTok ? ' download referrerpolicy="no-referrer" target="_blank"' : ''}>
+                ⬇ ${isTikTok ? '浏览器下载' : '下载'}
               </a>
             </div>
             <div class="copy-row">
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
+            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 直链需在能访问 TikTok 的浏览器中下载。若点击后直接播放，请右键视频「另存为」，或复制链接用下载工具获取。</div>' : ''}
           </div>
         </div>`;
     }
