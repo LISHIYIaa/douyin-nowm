@@ -20,6 +20,13 @@ import urllib.parse
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+# TikTok 下载需要 curl_cffi 模拟 Chrome TLS 指纹，绕过 Akamai 反爬
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 # ── 常量 ──────────────────────────────────────────────
 
 MOBILE_UA = (
@@ -685,56 +692,50 @@ def tk_resolve_url(share_url: str) -> str:
     return share_url
 
 def process_tiktok(share_url: str) -> dict:
-    """解析 TikTok 视频，使用 tikwm 第三方 API 获取无水印下载链接。
+    """解析 TikTok 视频展示信息。
 
-    原因：TikTok 官方 downloadAddr 需要 ttwid cookie + 浏览器指纹才能
-    返回真实视频流（否则返回空壳 0:00），且 Akamai 封锁数据中心 IP。
-    tikwm 等第三方服务提供可直接下载的无水印 CDN 链接。
+    注意：TikTok 官方视频直链（playAddr）绑定获取它的 cookie 会话，
+    跨会话下载会被 Akamai 403。因此这里只取展示信息（作者/描述/封面等），
+    真正的无水印原画下载由后端在「同一 curl_cffi 会话内」实时抓取并代理，
+    不经过前端跨域下载。download_url 返回原始链接供下载阶段复用。
     """
-    import json as _json
+    if not HAS_CURL_CFFI:
+        raise ValueError("服务端缺少 curl_cffi 依赖，无法解析 TikTok")
 
-    # 先展开短链 / 标准化 URL
     page_url = tk_resolve_url(share_url)
 
-    # 调用 tikwm API
-    api_url = f"https://www.tikwm.com/api/?url={page_url}"
-    req = urllib.request.Request(api_url, headers={
-        "User-Agent": DESKTOP_UA,
-        "Referer": "https://www.tikwm.com/",
-    })
-    resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=20)
-    api_data = _json.loads(resp.read())
+    s = cffi_requests.Session(impersonate="chrome")
+    s.get("https://www.tiktok.com/", headers={
+        "User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"
+    }, timeout=30)
+    r = s.get(page_url, headers={
+        "User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/"
+    }, timeout=30)
+    html = r.text.replace("\\u002F", "/").replace("\\u0026", "&") \
+                 .replace("\\u003C", "<").replace("\\u003E", ">")
 
-    if api_data.get("code") != 0 or not api_data.get("data"):
-        raise ValueError(api_data.get("msg") or "TikTok 解析失败（API 无返回数据）")
+    def grab(name, default=""):
+        m = re.search(r'"%s"\s*:\s*"([^"]*)"' % name, html)
+        return m.group(1) if m else default
 
-    info = api_data["data"]
+    def grabi(name, default=0):
+        m = re.search(r'"%s"\s*:\s*(\d+)' % name, html)
+        return int(m.group(1)) if m else default
 
-    # 提取字段（tikwm 返回的字段名）
-    author = (info.get("author", {}) or {}).get("unique_id", "") or "tiktok_user"
-    desc = info.get("title", "")
-    cover = info.get("cover", "") or info.get("origin_cover", "")
-    play_url = info.get("play", "")       # 无水印播放/下载地址
-    hdplay = info.get("hdplay", "")      # 高清版（如有）
-    music = info.get("music", "") or ""
-    dl_url = hdplay or play_url           # 优先高清
+    author = grab("uniqueId") or grab("nickname") or "tiktok_user"
+    desc = grab("desc")
+    cover = grab("originCover") or grab("cover")
+    width = grabi("width")
+    height = grabi("height")
+    duration_s = grabi("duration")
+    digg = grabi("diggCount")
+    comment = grabi("commentCount")
+    share = grabi("shareCount")
+    collect = grabi("collectCount")
 
-    if not dl_url:
-        raise ValueError("未获取到 TikTok 视频下载地址")
-
-    # tikwm 返回的时长单位是毫秒或秒，尝试两种格式
-    dur = info.get("duration", 0) or 0
-    try:
-        dur_s = int(dur)
-        if dur_s > 1000:  # 毫秒
-            duration = f"{dur_s // 60000:02d}:{(dur_s % 60000) // 1000:02d}"
-        else:  # 秒
-            duration = f"{dur_s // 60:02d}:{dur_s % 60:02d}"
-    except (ValueError, TypeError):
-        duration = ""
-
-    # 尝试从 play URL 推断分辨率（tikwm 不直接给 width/height）
-    resolution = "原画"  # tikwm 通常返回最高可用画质
+    resolution = f"{width}x{height}" if width and height else "原画"
+    duration = f"{duration_s // 60:02d}:{duration_s % 60:02d}" if duration_s else ""
 
     return {
         "platform": "tiktok",
@@ -744,14 +745,14 @@ def process_tiktok(share_url: str) -> dict:
         "cover_url": cover,
         "resolution": resolution,
         "duration": duration,
-        "download_url": dl_url,
-        "file_size_human": "需浏览器下载",
+        "download_url": page_url,   # 下载阶段后端重新解析（同会话代理）
+        "file_size_human": "服务端代理下载",
         "content_type": "video/mp4",
-        "digg_count": info.get("digg_count", 0) or 0,
-        "comment_count": info.get("comment_count", 0) or 0,
-        "share_count": info.get("share_count", 0) or 0,
-        "collected_count": info.get("collect_count", 0) or 0,
-        "client_download": True,
+        "digg_count": digg,
+        "comment_count": comment,
+        "share_count": share,
+        "collected_count": collect,
+        "server_download": True,    # 标记：走服务端 curl_cffi 代理
     }
 
 
@@ -1323,15 +1324,15 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${isTikTok ? '#' : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}"${isTikTok ? ' onclick="return tiktokDownload(event)"' : ''}>
-                ⬇ ${isTikTok ? '浏览器下载' : '下载'}
+              <a class="btn-download" href="${isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}">
+                ⬇ 下载
               </a>
             </div>
             <div class="copy-row">
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
-            ${isTikTok ? '<div class="tiktok-tip">提示：点击「浏览器下载」获取无水印视频。若点击后直接播放，请右键视频选择「另存为」保存。</div>' : ''}
+            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 无水印原画由服务端代理下载（画质为原始画质）。如长时间无响应可重试。</div>' : ''}
           </div>
         </div>`;
     }
@@ -1413,7 +1414,10 @@ class Handler(BaseHTTPRequestHandler):
             if not dl_url:
                 self.send_error(400, "Missing url")
                 return
-            self._proxy_download(dl_url, filename, platform)
+            if platform == "tiktok":
+                self.tk_proxy_download(dl_url, filename)
+            else:
+                self._proxy_download(dl_url, filename, platform)
 
         elif parsed.path == "/api/download_zip":
             qs = urllib.parse.parse_qs(parsed.query)
@@ -1560,6 +1564,83 @@ class Handler(BaseHTTPRequestHandler):
 
         except Exception as e:
             self._json(500, {"ok": False, "error": f"打包下载失败: {e}"})
+
+    def tk_proxy_download(self, share_url: str, filename: str):
+        """TikTok 无水印原画下载：同一 curl_cffi 会话内抓页面+下载。
+
+        关键点：playAddr 直链绑定获取它的 cookie 会话，跨会话会被 Akamai 403。
+        因此必须在一个 session 里完成「首页拿 ttwid → 页面拿 playAddr(去水印) →
+        同会话下载」。fallback：官方失败时尝试 tikwm 第三方直链。
+        """
+        if not HAS_CURL_CFFI:
+            self.send_error(500, "服务端缺少 curl_cffi 依赖")
+            return
+
+        UA = DESKTOP_UA
+        sess = cffi_requests.Session(impersonate="chrome")
+        # 1) 首页拿 ttwid cookie
+        sess.get("https://www.tiktok.com/", headers={
+            "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"
+        }, timeout=30)
+
+        # 2) 抓页面拿 playAddr
+        page_html = sess.get(share_url, headers={
+            "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.tiktok.com/"
+        }, timeout=30).text
+        h = page_html.replace("\\u002F", "/").replace("\\u0026", "&") \
+                     .replace("\\u003C", "<").replace("\\u003E", ">")
+        m = re.search(r'"playAddr"\s*:\s*"(https://[^"]+)"', h)
+        if m:
+            play_url = m.group(1).replace("playwm", "play")  # 去水印
+        else:
+            play_url = None
+
+        # 3) 同会话下载（curl_cffi 不启用 stream，否则 resp.content 为空）
+        video_bytes = None
+        ctype = "video/mp4"
+        if play_url:
+            try:
+                resp = sess.get(play_url, headers={
+                    "User-Agent": UA,
+                    "Accept": "video/webm,video/mp4,*/*;q=0.8",
+                    "Referer": "https://www.tiktok.com/"
+                }, timeout=120)
+                if resp.status_code == 200 and resp.content[:4] not in (b"<HTM", b"<htm", b"<!DO"):
+                    video_bytes = resp.content
+                    ctype = resp.headers.get("Content-Type", "video/mp4")
+            except Exception:
+                video_bytes = None
+
+        # 4) fallback：tikwm 第三方直链（画质略低但可用）
+        if not video_bytes:
+            try:
+                import json as _json
+                api = sess.get(
+                    f"https://www.tikwm.com/api/?url={urllib.parse.quote(share_url)}",
+                    headers={"User-Agent": UA, "Referer": "https://www.tikwm.com/"},
+                    timeout=20
+                )
+                d = _json.loads(api.text)
+                if d.get("code") == 0 and d.get("data", {}).get("play"):
+                    dl = d["data"]["play"]
+                    r2 = sess.get(dl, headers={"User-Agent": UA}, timeout=120)
+                    if r2.status_code == 200 and r2.content[:4] not in (b"<HTM",):
+                        video_bytes = r2.content
+            except Exception:
+                pass
+
+        if not video_bytes:
+            self.send_error(502, "TikTok video fetch failed (official and fallback both failed)")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", len(video_bytes))
+        enc = urllib.parse.quote(filename)
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{enc}")
+        self.end_headers()
+        self.wfile.write(video_bytes)
 
 
 def main():

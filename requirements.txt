@@ -1,1 +1,2 @@
-# 本项目仅使用 Python 标准库，无需第三方依赖
+# TikTok 下载需要 curl_cffi 模拟浏览器 TLS 指纹，绕过 Akamai 反爬
+curl_cffi==0.16.2
