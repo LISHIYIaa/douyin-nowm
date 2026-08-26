@@ -685,49 +685,56 @@ def tk_resolve_url(share_url: str) -> str:
     return share_url
 
 def process_tiktok(share_url: str) -> dict:
-    """解析 TikTok 视频，提取官方无水印下载地址（downloadAddr）。
+    """解析 TikTok 视频，使用 tikwm 第三方 API 获取无水印下载链接。
 
-    注意：TikTok 视频 CDN 有 Akamai 反爬，服务器端无法直接代理下载
-    （数据中心 IP 会被 403）。因此本函数只负责解析出无水印直链，
-    由前端用浏览器直接拉取（浏览器指纹可过 Akamai）。
+    原因：TikTok 官方 downloadAddr 需要 ttwid cookie + 浏览器指纹才能
+    返回真实视频流（否则返回空壳 0:00），且 Akamai 封锁数据中心 IP。
+    tikwm 等第三方服务提供可直接下载的无水印 CDN 链接。
     """
+    import json as _json
+
+    # 先展开短链 / 标准化 URL
     page_url = tk_resolve_url(share_url)
-    req = urllib.request.Request(page_url, headers={
+
+    # 调用 tikwm API
+    api_url = f"https://www.tikwm.com/api/?url={page_url}"
+    req = urllib.request.Request(api_url, headers={
         "User-Agent": DESKTOP_UA,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": TIKTOK_REFERER,
+        "Referer": "https://www.tikwm.com/",
     })
-    html = urllib.request.urlopen(req, context=SSL_CTX, timeout=20).read().decode("utf-8", errors="replace")
-    # 还原 HTML 转义，便于正则提取
-    h = (html.replace("\\u002F", "/").replace("\\u0026", "&")
-             .replace("\\u003C", "<").replace("\\u003E", ">"))
+    resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=20)
+    api_data = _json.loads(resp.read())
 
-    da = re.search(r'"downloadAddr"\s*:\s*"(https://[^"]+)"', h)
-    if not da:
-        raise ValueError("未找到 TikTok 视频下载地址（可能视频已删除或链接无效）")
-    dl = da.group(1)
+    if api_data.get("code") != 0 or not api_data.get("data"):
+        raise ValueError(api_data.get("msg") or "TikTok 解析失败（API 无返回数据）")
 
-    def grab(name, default=""):
-        m = re.search(r'"%s"\s*:\s*"([^"]*)"' % name, h)
-        return m.group(1) if m else default
+    info = api_data["data"]
 
-    def grabi(name, default=0):
-        m = re.search(r'"%s"\s*:\s*(\d+)' % name, h)
-        return int(m.group(1)) if m else default
+    # 提取字段（tikwm 返回的字段名）
+    author = (info.get("author", {}) or {}).get("unique_id", "") or "tiktok_user"
+    desc = info.get("title", "")
+    cover = info.get("cover", "") or info.get("origin_cover", "")
+    play_url = info.get("play", "")       # 无水印播放/下载地址
+    hdplay = info.get("hdplay", "")      # 高清版（如有）
+    music = info.get("music", "") or ""
+    dl_url = hdplay or play_url           # 优先高清
 
-    author = grab("uniqueId") or grab("nickname") or "tiktok_user"
-    desc = grab("desc")
-    cover = grab("originCover") or grab("cover")
-    width = grabi("width")
-    height = grabi("height")
-    duration_s = grabi("duration")
-    digg = grabi("diggCount")
-    comment = grabi("commentCount")
-    share = grabi("shareCount")
-    collect = grabi("collectCount")
+    if not dl_url:
+        raise ValueError("未获取到 TikTok 视频下载地址")
 
-    resolution = f"{width}x{height}" if width and height else "原画"
-    duration = f"{duration_s // 60:02d}:{duration_s % 60:02d}" if duration_s else ""
+    # tikwm 返回的时长单位是毫秒或秒，尝试两种格式
+    dur = info.get("duration", 0) or 0
+    try:
+        dur_s = int(dur)
+        if dur_s > 1000:  # 毫秒
+            duration = f"{dur_s // 60000:02d}:{(dur_s % 60000) // 1000:02d}"
+        else:  # 秒
+            duration = f"{dur_s // 60:02d}:{dur_s % 60:02d}"
+    except (ValueError, TypeError):
+        duration = ""
+
+    # 尝试从 play URL 推断分辨率（tikwm 不直接给 width/height）
+    resolution = "原画"  # tikwm 通常返回最高可用画质
 
     return {
         "platform": "tiktok",
@@ -737,14 +744,14 @@ def process_tiktok(share_url: str) -> dict:
         "cover_url": cover,
         "resolution": resolution,
         "duration": duration,
-        "download_url": dl,
+        "download_url": dl_url,
         "file_size_human": "需浏览器下载",
         "content_type": "video/mp4",
-        "digg_count": digg,
-        "comment_count": comment,
-        "share_count": share,
-        "collected_count": collect,
-        "client_download": True,  # 标记：浏览器直链下载，不走服务端代理
+        "digg_count": info.get("digg_count", 0) or 0,
+        "comment_count": info.get("comment_count", 0) or 0,
+        "share_count": info.get("share_count", 0) or 0,
+        "collected_count": info.get("collect_count", 0) or 0,
+        "client_download": True,
     }
 
 
@@ -1324,7 +1331,7 @@ async function parseLink() {
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
-            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 直链为限时签名地址，点击「浏览器下载」会实时重新获取最新链接。若你的网络无法访问 TikTok（如国内未开代理），浏览器将无法加载视频——此时请复制链接，在可访问 TikTok 的环境下载。</div>' : ''}
+            ${isTikTok ? '<div class="tiktok-tip">提示：点击「浏览器下载」获取无水印视频。若点击后直接播放，请右键视频选择「另存为」保存。</div>' : ''}
           </div>
         </div>`;
     }
