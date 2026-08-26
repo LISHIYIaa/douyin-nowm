@@ -692,12 +692,11 @@ def tk_resolve_url(share_url: str) -> str:
     return share_url
 
 def process_tiktok(share_url: str) -> dict:
-    """解析 TikTok 视频展示信息。
+    """解析 TikTok 视频展示信息（含 bitrateInfo 画质详情）。
 
     注意：TikTok 官方视频直链（playAddr）绑定获取它的 cookie 会话，
     跨会话下载会被 Akamai 403。因此这里只取展示信息（作者/描述/封面等），
-    真正的无水印原画下载由后端在「同一 curl_cffi 会话内」实时抓取并代理，
-    不经过前端跨域下载。download_url 返回原始链接供下载阶段复用。
+    真正的无水印原画下载由后端在「同一 curl_cffi 会话内」实时抓取并代理。
     """
     if not HAS_CURL_CFFI:
         raise ValueError("服务端缺少 curl_cffi 依赖，无法解析 TikTok")
@@ -734,7 +733,40 @@ def process_tiktok(share_url: str) -> dict:
     share = grabi("shareCount")
     collect = grabi("collectCount")
 
-    resolution = f"{width}x{height}" if width and height else "原画"
+    # ---- 解析 bitrateInfo 获取画质详情 ----
+    quality_detail = ""
+    total_bitrates = 0
+    best_gear = ""
+    best_size = 0
+    bm = re.search(r'"bitrateInfo"\s*(?::\s*)(\[.*?\])(?:\s*,|\s*\})', html, re.DOTALL)
+    if bm:
+        try:
+            import json as _json
+            raw = bm.group(1).rstrip()
+            if raw.endswith(','):
+                raw = raw[:-1]
+            bitrates = _json.loads(raw)
+            if isinstance(bitrates, list):
+                total_bitrates = len(bitrates)
+                sorted_br = sorted(bitrates, key=lambda x: x.get("Bitrate", 0), reverse=True)
+                if sorted_br:
+                    top = sorted_br[0]
+                    pa = top.get("PlayAddr", {})
+                    best_gear = top.get("GearName", "")
+                    best_size = int(pa.get("DataSize", 0))
+                    br_kbps = top.get("Bitrate", 0) // 1000
+                    w = pa.get("Width", width)
+                    h = pa.get("Height", height)
+                    quality_detail = f"{w}x{h} \u00b7 {br_kbps}kbps \u00b7 {format_size(best_size)}"
+                    if total_bitrates > 1:
+                        quality_detail += f" ({total_bitrates}\u79cd\u753b\u8d28\u53ef\u9009\uff0c\u5df2\u9009\u6700\u9ad8)"
+        except Exception:
+            pass
+
+    if not quality_detail:
+        resolution = f"{width}x{height}" if width and height else "\u539f\u753b"
+        quality_detail = resolution
+
     duration = f"{duration_s // 60:02d}:{duration_s % 60:02d}" if duration_s else ""
 
     return {
@@ -743,16 +775,19 @@ def process_tiktok(share_url: str) -> dict:
         "author": author,
         "desc": desc,
         "cover_url": cover,
-        "resolution": resolution,
+        "resolution": f"{width}x{height}" if width and height else "\u539f\u753b",
         "duration": duration,
-        "download_url": page_url,   # 下载阶段后端重新解析（同会话代理）
-        "file_size_human": "服务端代理下载",
+        "download_url": page_url,
+        "file_size_human": format_size(best_size) if best_size else "\u670d\u52a1\u7aef\u4ee3\u7406\u4e0b\u8f7d",
+        "file_size": best_size,
         "content_type": "video/mp4",
         "digg_count": digg,
         "comment_count": comment,
         "share_count": share,
         "collected_count": collect,
-        "server_download": True,    # 标记：走服务端 curl_cffi 代理
+        "server_download": True,
+        "quality_detail": quality_detail,
+        "gear_name": best_gear,
     }
 
 
@@ -1322,7 +1357,7 @@ async function parseLink() {
             <div class="download-bar">
               <div class="download-info">
                 <div class="download-quality">${badge}</div>
-                <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
+                <div class="download-size">${isTikTok ? (data.quality_detail || data.file_size_human) : data.file_size_human} · ${data.content_type}</div>
               </div>
               <a class="btn-download" href="${isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}">
                 ⬇ 下载
@@ -1565,11 +1600,74 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json(500, {"ok": False, "error": f"打包下载失败: {e}"})
 
+    def _tk_extract_best_video_url(self, html: str) -> tuple:
+        """从 TikTok 页面 HTML 中提取最佳画质视频地址。
+
+        优先级：
+        1. bitrateInfo 中 Bitrate 最高的 PlayAddr.UrlList[0]（去水印）
+        2. 顶层 downloadAddr（去水印）
+        3. 顶层 playAddr（去水印）
+
+        返回 (url, quality_info_dict) 或 (None, None)
+        """
+        h = html.replace("\\u002F", "/").replace("\\u0026", "&") \
+                 .replace("\\u003C", "<").replace("\\u003E", ">")
+
+        # ---- 1) 尝试解析 bitrateInfo，选最高码率 ----
+        best_url = None
+        best_bitrate = 0
+        best_info = None
+        bm = re.search(r'"bitrateInfo"\s*(?::\s*)(\[.*?\])(?:\s*,|\s*\})', h, re.DOTALL)
+        if bm:
+            try:
+                import json as _json
+                # 修复 JSON 中可能的 trailing comma 等问题
+                raw = bm.group(1).rstrip()
+                if raw.endswith(','):
+                    raw = raw[:-1]
+                bitrates = _json.loads(raw)
+                if isinstance(bitrates, list):
+                    for item in bitrates:
+                        if not isinstance(item, dict):
+                            continue
+                        br = item.get("Bitrate", 0)
+                        if br > best_bitrate:
+                            pa = item.get("PlayAddr", {})
+                            urls = pa.get("UrlList", [])
+                            if urls:
+                                best_bitrate = br
+                                best_url = urls[0].replace("/playwm/", "/play/")
+                                best_info = {
+                                    "bitrate": br,
+                                    "gear_name": item.get("GearName", ""),
+                                    "quality_type": item.get("QualityType", 0),
+                                    "width": pa.get("Width", 0),
+                                    "height": pa.get("Height", 0),
+                                    "data_size": int(pa.get("DataSize", 0)),
+                                }
+            except Exception:
+                pass
+
+        if best_url:
+            return best_url, best_info
+
+        # ---- 2) 尝试 downloadAddr ----
+        m = re.search(r'"downloadAddr"\s*:\s*"(https://[^"]+)"', h)
+        if m:
+            return m.group(1).replace("/playwm/", "/play/"), {"source": "downloadAddr"}
+
+        # ---- 3) 回退到 playAddr ----
+        m = re.search(r'"playAddr"\s*:\s*"(https://[^"]+)"', h)
+        if m:
+            return m.group(1).replace("/playwm/", "/play/"), {"source": "playAddr"}
+
+        return None, None
+
     def tk_proxy_download(self, share_url: str, filename: str):
-        """TikTok 无水印原画下载：同一 curl_cffi 会话内抓页面+下载。
+        """TikTok 无水印原画下载：同一 curl_cffi 会话��抓页面+下载。
 
         关键点：playAddr 直链绑定获取它的 cookie 会话，跨会话会被 Akamai 403。
-        因此必须在一个 session 里完成「首页拿 ttwid → 页面拿 playAddr(去水印) →
+        因此必须在一个 session 里完成「首页拿 ttwid → 页面拿最佳playAddr(去水印) →
         同会话下载」。fallback：官方失败时尝试 tikwm 第三方直链。
         """
         if not HAS_CURL_CFFI:
@@ -1583,18 +1681,13 @@ class Handler(BaseHTTPRequestHandler):
             "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"
         }, timeout=30)
 
-        # 2) 抓页面拿 playAddr
+        # 2) 抓页面，提取最佳画质地址
         page_html = sess.get(share_url, headers={
             "User-Agent": UA, "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.tiktok.com/"
         }, timeout=30).text
-        h = page_html.replace("\\u002F", "/").replace("\\u0026", "&") \
-                     .replace("\\u003C", "<").replace("\\u003E", ">")
-        m = re.search(r'"playAddr"\s*:\s*"(https://[^"]+)"', h)
-        if m:
-            play_url = m.group(1).replace("playwm", "play")  # 去水印
-        else:
-            play_url = None
+
+        play_url, quality_info = self._tk_extract_best_video_url(page_html)
 
         # 3) 同会话下载（curl_cffi 不启用 stream，否则 resp.content 为空）
         video_bytes = None
@@ -1609,6 +1702,9 @@ class Handler(BaseHTTPRequestHandler):
                 if resp.status_code == 200 and resp.content[:4] not in (b"<HTM", b"<htm", b"<!DO"):
                     video_bytes = resp.content
                     ctype = resp.headers.get("Content-Type", "video/mp4")
+                    # 记录实际下载大小
+                    if quality_info:
+                        quality_info["actual_size"] = len(resp.content)
             except Exception:
                 video_bytes = None
 
@@ -1627,12 +1723,19 @@ class Handler(BaseHTTPRequestHandler):
                     r2 = sess.get(dl, headers={"User-Agent": UA}, timeout=120)
                     if r2.status_code == 200 and r2.content[:4] not in (b"<HTM",):
                         video_bytes = r2.content
+                        quality_info = {"source": "tikwm_fallback", "actual_size": len(r2.content)}
             except Exception:
                 pass
 
         if not video_bytes:
             self.send_error(502, "TikTok video fetch failed (official and fallback both failed)")
             return
+
+        # 构建更清晰的文件名（含画质信息）
+        if quality_info and quality_info.get("gear_name"):
+            gn = quality_info["gear_name"]
+            if filename.endswith(".mp4"):
+                filename = filename[:-4] + f"_{gn}.mp4"
 
         self.send_response(200)
         self.send_header("Content-Type", ctype)

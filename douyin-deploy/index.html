@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>抖音去水印 · 原视频下载</title>
+<style>
+  :root {
+    --bg: #0f0f13;
+    --card: #1a1a22;
+    --card-hover: #22222e;
+    --border: #2e2e3a;
+    --text: #e8e8ef;
+    --text-dim: #8888a0;
+    --accent: #ff2c55;
+    --accent-hover: #ff4470;
+    --accent-dim: rgba(255,44,85,.12);
+    --green: #00d68f;
+    --radius: 16px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .container { width: 100%; max-width: 560px; }
+
+  .header { text-align: center; margin-bottom: 32px; }
+  .logo {
+    display: inline-flex; align-items: center; gap: 10px;
+    font-size: 24px; font-weight: 700; margin-bottom: 8px;
+  }
+  .logo-icon {
+    width: 40px; height: 40px; border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent), #ff6b8a);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .subtitle { color: var(--text-dim); font-size: 14px; }
+
+  .input-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+  }
+  .input-row { display: flex; gap: 12px; }
+  .input-wrap { flex: 1; position: relative; }
+  .input-wrap input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px 14px 42px;
+    color: var(--text);
+    font-size: 15px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .input-wrap input:focus { border-color: var(--accent); }
+  .input-wrap input::placeholder { color: var(--text-dim); }
+  .input-icon {
+    position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+    font-size: 18px; opacity: .5;
+  }
+  .btn-parse {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 12px;
+    padding: 14px 24px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .2s, transform .1s;
+  }
+  .btn-parse:hover { background: var(--accent-hover); }
+  .btn-parse:active { transform: scale(.96); }
+  .btn-parse:disabled { opacity: .5; cursor: not-allowed; }
+
+  .quality-row {
+    display: flex; align-items: center; gap: 8px;
+    margin-top: 14px; font-size: 13px; color: var(--text-dim);
+  }
+  .quality-toggle {
+    display: inline-flex; background: var(--bg); border-radius: 10px; padding: 3px;
+    border: 1px solid var(--border);
+  }
+  .quality-toggle button {
+    background: none; border: none; color: var(--text-dim);
+    padding: 6px 14px; border-radius: 8px; font-size: 13px; cursor: pointer;
+    transition: all .2s;
+  }
+  .quality-toggle button.active {
+    background: var(--accent-dim); color: var(--accent);
+  }
+
+  .loading {
+    text-align: center; padding: 40px 0; color: var(--text-dim);
+  }
+  .spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    margin: 0 auto 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .error {
+    background: rgba(255,44,85,.1);
+    border: 1px solid rgba(255,44,85,.3);
+    border-radius: 12px;
+    padding: 16px;
+    color: #ff6b8a;
+    font-size: 14px;
+    margin-top: 16px;
+    line-height: 1.6;
+  }
+
+  .result-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-top: 20px;
+    animation: slideUp .3s ease;
+  }
+  @keyframes slideUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .result-cover {
+    width: 100%; max-height: 220px; object-fit: cover;
+    display: block;
+  }
+  .result-body { padding: 20px; }
+  .result-author {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 14px; color: var(--accent); margin-bottom: 6px; font-weight: 600;
+  }
+  .result-desc {
+    font-size: 14px; color: var(--text); margin-bottom: 16px;
+    line-height: 1.5;
+  }
+
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+    margin-bottom: 20px;
+  }
+  .stat {
+    background: var(--bg); border-radius: 10px; padding: 12px 8px;
+    text-align: center;
+  }
+  .stat-val { font-size: 16px; font-weight: 700; }
+  .stat-label { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  .download-bar {
+    display: flex; gap: 12px; align-items: center;
+    background: var(--bg); border-radius: 12px; padding: 14px 16px;
+  }
+  .download-info { flex: 1; min-width: 0; }
+  .download-quality { font-size: 13px; font-weight: 600; color: var(--green); }
+  .download-size { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+  .btn-download {
+    background: var(--green);
+    color: #002618;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: opacity .2s, transform .1s;
+  }
+  .btn-download:hover { opacity: .85; }
+  .btn-download:active { transform: scale(.95); }
+
+  .copy-row {
+    display: flex; gap: 8px; margin-top: 12px;
+  }
+  .copy-input {
+    flex: 1; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; color: var(--text-dim);
+    font-size: 12px; outline: none;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .btn-copy {
+    background: var(--card-hover); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 16px; color: var(--text);
+    font-size: 13px; cursor: pointer; white-space: nowrap;
+    transition: background .2s;
+  }
+  .btn-copy:hover { background: var(--border); }
+  .btn-copy.copied { background: var(--green); color: #002618; border-color: var(--green); }
+
+  .footer {
+    text-align: center; color: var(--text-dim); font-size: 12px;
+    margin-top: 24px;
+    line-height: 1.6;
+  }
+
+  .proxy-note {
+    margin-top: 12px; font-size: 11px; color: var(--text-dim);
+    text-align: center; line-height: 1.5;
+  }
+  .proxy-selector {
+    display: flex; align-items: center; gap: 6px;
+    justify-content: center; margin-top: 8px;
+  }
+  .proxy-selector select {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px 8px; color: var(--text-dim);
+    font-size: 12px; outline: none;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">🎬</div>
+      <span>抖音去水印</span>
+    </div>
+    <p class="subtitle">粘贴链接，一键获取无水印原视频</p>
+  </div>
+
+  <div class="input-card">
+    <div class="input-row">
+      <div class="input-wrap">
+        <span class="input-icon">🔗</span>
+        <input type="text" id="url-input" placeholder="粘贴抖音分享链接..." autofocus>
+      </div>
+      <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
+    </div>
+    <div class="quality-row">
+      <span>清晰度：</span>
+      <div class="quality-toggle">
+        <button class="active" data-q="default" onclick="setQuality('default')">原画</button>
+        <button data-q="720p" onclick="setQuality('720p')">720P</button>
+      </div>
+    </div>
+    <div class="proxy-note">
+      解析代理：
+      <div class="proxy-selector">
+        <select id="proxy-select">
+          <option value="auto">自动选择</option>
+          <option value="allorigins">AllOrigins</option>
+          <option value="corsproxy">CorsProxy.io</option>
+          <option value="codetabs">CodeTabs</option>
+        </select>
+      </div>
+    </div>
+    <div id="error-msg"></div>
+  </div>
+
+  <div id="result-area"></div>
+
+  <div class="footer">
+    本工具仅供学习交流使用 · 请尊重创作者版权<br>
+    纯前端实现，无需服务器
+  </div>
+</div>
+
+<script>
+let quality = 'default';
+const urlInput = document.getElementById('url-input');
+const btnParse = document.getElementById('btn-parse');
+const resultArea = document.getElementById('result-area');
+const errorEl = document.getElementById('error-msg');
+const proxySelect = document.getElementById('proxy-select');
+
+urlInput.addEventListener('keydown', e => { if (e.key === 'Enter') parseLink(); });
+
+function setQuality(q) {
+  quality = q;
+  document.querySelectorAll('.quality-toggle button').forEach(b => {
+    b.classList.toggle('active', b.dataset.q === q);
+  });
+}
+
+function showError(msg) {
+  errorEl.innerHTML = '<div class="error">⚠️ ' + msg + '</div>';
+}
+
+function clearError() { errorEl.innerHTML = ''; }
+
+function formatNum(n) {
+  if (!n) return '0';
+  if (n >= 10000) return (n / 10000).toFixed(1) + '万';
+  return n.toLocaleString();
+}
+
+function formatSize(bytes) {
+  if (!bytes) return '未知';
+  if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
+  if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function formatDuration(ms) {
+  const s = Math.floor(ms / 1000);
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return y + '-' + m + '-' + day;
+}
+
+// ── CORS 代理列表 ──────────────────────────────
+const PROXIES = {
+  allorigins: url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  corsproxy: url => 'https://corsproxy.io/?url=' + encodeURIComponent(url),
+  codetabs: url => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(url),
+};
+
+async function fetchViaProxy(targetUrl, preferredProxy) {
+  const proxyOrder = preferredProxy === 'auto'
+    ? ['allorigins', 'corsproxy', 'codetabs']
+    : [preferredProxy, 'allorigins', 'corsproxy', 'codetabs'].filter((v, i, a) => a.indexOf(v) === i);
+
+  let lastErr = null;
+  for (const name of proxyOrder) {
+    const proxyUrl = PROXIES[name](targetUrl);
+    try {
+      const resp = await fetch(proxyUrl, {
+        signal: AbortSignal.timeout(20000),
+        headers: { 'Accept': 'text/html,application/xhtml+xml,application/json' }
+      });
+      if (!resp.ok) { lastErr = new Error(name + ' 返回 ' + resp.status); continue; }
+      const text = await resp.text();
+      if (text && text.length > 500) {
+        return text;
+      }
+      lastErr = new Error(name + ' 返回内容过短');
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error('所有代理均失败：' + (lastErr ? lastErr.message : '未知错误') + '<br>请尝试切换代理或稍后重试');
+}
+
+// ── 解析视频ID ──────────────────────────────────
+function extractVideoId(url) {
+  let m = url.match(/\/video\/(\d+)/);
+  if (m) return m[1];
+  m = url.match(/\/share\/video\/(\d+)/);
+  if (m) return m[1];
+  m = url.match(/\/(\d{15,})/);
+  if (m) return m[1];
+  return null;
+}
+
+// ── 解析 _ROUTER_DATA ───────────────────────────
+function parseRouterData(html) {
+  const match = html.match(/window\._ROUTER_DATA\s*=\s*(\{[\s\S]*?\})\s*<\/script>/);
+  if (!match) throw new Error('页面中未找到 _ROUTER_DATA，可能抖音页面结构已变更');
+  let raw = match[1];
+  // 解码 unicode 转义
+  raw = raw.replace(/\\u002F/g, '/').replace(/\\u0026/g, '&')
+           .replace(/\\u003C/g, '<').replace(/\\u003E/g, '>');
+  return JSON.parse(raw);
+}
+
+// ── 提取视频信息 ─────────────────────────────────
+function extractVideoInfo(routerData) {
+  const loader = routerData.loaderData || {};
+  for (const key in loader) {
+    const val = loader[key];
+    if (!val || typeof val !== 'object') continue;
+    const vir = val.videoInfoRes;
+    if (!vir) continue;
+    const items = vir.item_list;
+    if (!items || !items.length) continue;
+
+    const item = items[0];
+    const video = item.video || {};
+    const playAddr = video.play_addr || {};
+    const uri = playAddr.uri || '';
+    if (!uri) throw new Error('未能提取 video uri');
+
+    const createTs = item.create_time || 0;
+
+    return {
+      aweme_id: item.aweme_id || '',
+      desc: item.desc || '',
+      nickname: (item.author || {}).nickname || '',
+      video_uri: uri,
+      width: video.width || 0,
+      height: video.height || 0,
+      duration_ms: video.duration || 0,
+      create_time: createTs,
+      pub_date: formatDate(createTs),
+      digg_count: (item.statistics || {}).digg_count || 0,
+      comment_count: (item.statistics || {}).comment_count || 0,
+      share_count: (item.statistics || {}).share_count || 0,
+      cover_url: ((video.cover || {}).url_list || [''])[0] || '',
+    };
+  }
+  throw new Error('未找到视频信息');
+}
+
+// ── 构建下载链接 ─────────────────────────────────
+function buildDownloadUrl(uri, q) {
+  return 'https://aweme.snssdk.com/aweme/v1/play/?video_id=' + uri + '&ratio=' + q + '&line=0';
+}
+
+// ── 探测文件大小（通过代理 HEAD 请求）──────────────
+async function probeFileSize(downloadUrl, proxyName) {
+  // 尝试通过代理获取文件大小
+  try {
+    const proxyOrder = proxyName === 'auto'
+      ? ['allorigins', 'corsproxy', 'codetabs']
+      : [proxyName];
+
+    for (const name of proxyOrder) {
+      try {
+        const proxyUrl = PROXIES[name](downloadUrl);
+        const resp = await fetch(proxyUrl, {
+          method: 'GET',
+          signal: AbortSignal.timeout(10000),
+          headers: { 'Range': 'bytes=0-0' }
+        });
+        const cr = resp.headers.get('Content-Range');
+        if (cr) {
+          const m = cr.match(/\/(\d+)/);
+          if (m) return parseInt(m[1]);
+        }
+        const cl = resp.headers.get('Content-Length');
+        if (cl) return parseInt(cl);
+      } catch (e) { /* try next */ }
+    }
+  } catch (e) { /* ignore */ }
+  return 0;
+}
+
+// ── 主解析流程 ───────────────────────────────────
+async function parseLink() {
+  const url = urlInput.value.trim();
+  if (!url) { showError('请输入抖音视频链接'); return; }
+
+  clearError();
+  resultArea.innerHTML = '';
+  btnParse.disabled = true;
+  btnParse.textContent = '解析中...';
+
+  resultArea.innerHTML = `
+    <div class="result-card"><div class="loading">
+      <div class="spinner"></div>
+      <p>正在解析视频信息...</p>
+    </div></div>`;
+
+  const proxyName = proxySelect.value;
+
+  try {
+    // Step 1: 确定页面 URL
+    let pageUrl;
+    let videoId = extractVideoId(url);
+
+    if (url.includes('v.douyin.com') || (!videoId && url.match(/^https?:\/\/[^/]+\//))) {
+      // 短链接：通过代理获取页面（代理会跟随重定向到最终页面）
+      pageUrl = url;
+    } else if (videoId) {
+      // 长链接：直接构造 iesdouyin 分享页
+      pageUrl = 'https://www.iesdouyin.com/share/video/' + videoId + '/';
+    } else {
+      throw new Error('无法识别的链接格式，请粘贴抖音分享链接');
+    }
+
+    // Step 2: 通过代理获取页面 HTML
+    const html = await fetchViaProxy(pageUrl, proxyName);
+
+    // 从 HTML 中提取 videoId（短链接场景）
+    if (!videoId) {
+      videoId = extractVideoId(html);
+    }
+
+    // Step 3: 解析 _ROUTER_DATA
+    const routerData = parseRouterData(html);
+
+    // Step 4: 提取视频信息
+    const info = extractVideoInfo(routerData);
+
+    // Step 5: 构建下载链接
+    const dlUrl = buildDownloadUrl(info.video_uri, quality);
+
+    // Step 6: 探测文件大小
+    const fileSize = await probeFileSize(dlUrl, proxyName);
+
+    // Step 7: 渲染结果
+    const badge = quality === 'default'
+      ? '<span style="color:var(--green)">原始高清</span>'
+      : '<span style="color:var(--text-dim)">720P 压缩</span>';
+
+    const safeAuthor = (info.nickname || 'video').replace(/[\\/:*?"<>|#]/g, '_');
+    const safeDate = info.pub_date || '';
+    const fileName = safeAuthor + '_' + safeDate + '.mp4';
+
+    // 下载链接：通过代理下载（绕过 CORS）
+    const downloadHref = PROXIES[proxyName === 'auto' ? 'allorigins' : proxyName](dlUrl);
+
+    resultArea.innerHTML = `
+      <div class="result-card">
+        ${info.cover_url ? `<img class="result-cover" src="${info.cover_url}" alt="cover" onerror="this.style.display='none'">` : ''}
+        <div class="result-body">
+          <div class="result-author">@${info.nickname}${info.pub_date ? ' · ' + info.pub_date : ''}</div>
+          <div class="result-desc">${info.desc || '无描述'}</div>
+          <div class="stats">
+            <div class="stat">
+              <div class="stat-val">${info.width}x${info.height}</div>
+              <div class="stat-label">分辨率</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val">${formatDuration(info.duration_ms)}</div>
+              <div class="stat-label">时长</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val">${formatNum(info.digg_count)}</div>
+              <div class="stat-label">点赞</div>
+            </div>
+            <div class="stat">
+              <div class="stat-val">${formatNum(info.comment_count)}</div>
+              <div class="stat-label">评论</div>
+            </div>
+          </div>
+          <div class="download-bar">
+            <div class="download-info">
+              <div class="download-quality">${badge}</div>
+              <div class="download-size">${fileSize ? formatSize(fileSize) : '点击下载获取'} · video/mp4</div>
+            </div>
+            <a class="btn-download" href="${downloadHref}" download="${fileName}" target="_blank" rel="noopener">
+              下载
+            </a>
+          </div>
+          <div class="copy-row">
+            <input class="copy-input" id="dl-url" value="${dlUrl}" readonly>
+            <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
+          </div>
+        </div>
+      </div>`;
+
+    // 如果文件大小获取失败，尝试通过代理 HEAD 获取
+    if (!fileSize) {
+      probeInBackground(dlUrl, proxyName);
+    }
+
+  } catch (err) {
+    resultArea.innerHTML = '';
+    let errMsg = err.message || String(err);
+    if (errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError')) {
+      errMsg = '网络请求失败，可能是 CORS 代理不可用。请尝试切换下方代理选项后重试。';
+    }
+    showError(errMsg);
+  } finally {
+    btnParse.disabled = false;
+    btnParse.textContent = '解析';
+  }
+}
+
+// 后台探测文件大小
+async function probeInBackground(dlUrl, proxyName) {
+  try {
+    const size = await probeFileSize(dlUrl, proxyName);
+    if (size) {
+      const sizeEl = document.querySelector('.download-size');
+      if (sizeEl) {
+        sizeEl.textContent = formatSize(size) + ' · video/mp4';
+      }
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function copyLink(btn) {
+  const input = document.getElementById('dl-url');
+  navigator.clipboard.writeText(input.value).then(() => {
+    btn.textContent = '已复制';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制链接';
+      btn.classList.remove('copied');
+    }, 2000);
+  }).catch(() => {
+    // fallback
+    input.select();
+    document.execCommand('copy');
+    btn.textContent = '已复制';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = '复制链接';
+      btn.classList.remove('copied');
+    }, 2000);
+  });
+}
+</script>
+</body>
+</html>
