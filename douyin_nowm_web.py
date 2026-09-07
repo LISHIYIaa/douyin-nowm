@@ -12,8 +12,11 @@
 import argparse
 import io
 import json
+import os
 import re
+import shutil
 import ssl
+import tempfile
 import zipfile
 import urllib.request
 import urllib.parse
@@ -26,6 +29,19 @@ try:
     HAS_CURL_CFFI = True
 except ImportError:
     HAS_CURL_CFFI = False
+
+# YouTube 下载需要 yt-dlp；ffmpeg 用 imageio-ffmpeg 提供的静态二进制（Render 无系统 ffmpeg）
+try:
+    import yt_dlp
+    try:
+        import imageio_ffmpeg
+        FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        FFMPEG_EXE = None
+    HAS_YTDLP = True
+except ImportError:
+    HAS_YTDLP = False
+    FFMPEG_EXE = None
 
 # ── 常量 ──────────────────────────────────────────────
 
@@ -81,15 +97,17 @@ def extract_url_from_text(text: str) -> str:
 # ── 平台检测 ──────────────────────────────────────────
 
 def detect_platform(url: str) -> str:
-    """根据 URL 判断平台：douyin / xhs / tiktok"""
+    """根据 URL 判断平台：douyin / xhs / tiktok / youtube"""
     lower = url.lower()
+    if any(k in lower for k in ["youtube.com", "youtu.be", "youtube-nocookie.com", "youtu.be/"]):
+        return "youtube"
     if any(k in lower for k in ["douyin.com", "iesdouyin.com", "v.douyin.com"]):
         return "douyin"
     if any(k in lower for k in ["xiaohongshu.com", "xhslink.com", "xhs.cn"]):
         return "xhs"
     if any(k in lower for k in ["tiktok.com", "tiktokcdn.com", "vm.tiktok.com", "vt.tiktok.com"]):
         return "tiktok"
-    raise ValueError("无法识别链接平台，目前支持抖音、小红书和 TikTok")
+    raise ValueError("无法识别链接平台，目前支持抖音、小红书、TikTok 和 YouTube")
 
 
 # ── 抖音核心逻辑 ──────────────────────────────────────
@@ -801,7 +819,97 @@ def process_link(share_url: str, quality: str = "default") -> dict:
         return process_xhs(url)
     elif platform == "tiktok":
         return process_tiktok(url)
+    elif platform == "youtube":
+        return process_youtube(url, quality)
     raise ValueError("不支持的平台")
+
+
+# ── YouTube 核心逻辑 ──────────────────────────────────────
+
+def _yt_base_opts(download: bool = False) -> dict:
+    """yt-dlp 通用选项。download=True 用于真正下载并合并。"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        "nocheckcertificate": True,
+        # 数据中心 IP 常被 YouTube 反爬；tv_embedded 客户端能返回完整分辨率（含 4K），
+        # 且无需 po_token。注意：多个客户端组成的「列表」会被 yt-dlp 降级为最低画质，
+        # 因此这里只用单客户端 tv_embedded。
+        "extractor_args": {
+            "youtube": {
+                "player_client": "tv_embedded",
+            }
+        },
+    }
+    if FFMPEG_EXE:
+        opts["ffmpeg_location"] = FFMPEG_EXE
+    return opts
+
+
+def process_youtube(share_url: str, quality: str = "best") -> dict:
+    """解析 YouTube 视频展示信息（标题/作者/分辨率/大小等）。
+
+    注意：YouTube 直链受严格反爬 + 音视频分离（DASH），无法像 TikTok 那样直接代理。
+    真正的「最高清」下载由后端用 yt-dlp 在服务端抓取并合并（见 yt_proxy_download）。
+    """
+    if not HAS_YTDLP:
+        raise ValueError("服务端缺少 yt-dlp 依赖，无法解析 YouTube")
+
+    url = extract_url_from_text(share_url)
+
+    # 探测最佳格式（不下载），用于展示分辨率/大小。
+    # 注意：YouTube 高清流多为 vp9/webm，不能限定 ext=mp4，否则最高只到 360p。
+    probe_opts = _yt_base_opts()
+    probe_opts.update({
+        "simulate": True,
+        "format": "bestvideo+bestaudio/best",
+    })
+    try:
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        raise ValueError(f"YouTube 解析失败（可能被反爬拦截，可重试或换链接）: {e}")
+
+    # 处理播放列表：取第一个视频
+    if info.get("_type") == "playlist":
+        entries = info.get("entries") or []
+        if not entries:
+            raise ValueError("YouTube 播放列表为空或解析失败")
+        info = entries[0]
+
+    title = info.get("title", "youtube_video")
+    author = info.get("uploader") or info.get("channel") or info.get("uploader_id") or "youtube"
+    duration_s = int(info.get("duration") or 0)
+    width = info.get("width") or 0
+    height = info.get("height") or 0
+    # 优先用合并后格式的文件大小
+    size = int(info.get("filesize") or info.get("filesize_approx") or 0)
+    if not size and info.get("formats"):
+        best_fmt = max(
+            [f for f in info["formats"] if f.get("filesize")],
+            key=lambda f: f.get("filesize", 0), default={}
+        )
+        size = int(best_fmt.get("filesize", 0))
+
+    resolution = f"{width}x{height}" if width and height else "原画"
+    duration = f"{duration_s // 60:02d}:{duration_s % 60:02d}" if duration_s else ""
+
+    return {
+        "platform": "youtube",
+        "ok": True,
+        "author": author,
+        "desc": title,
+        "cover_url": info.get("thumbnail") or "",
+        "resolution": resolution,
+        "duration": duration,
+        "download_url": url,
+        "file_size_human": format_size(size) if size else "服务端代理下载",
+        "file_size": size,
+        "content_type": "video/mp4",
+        "note": "YouTube 最高清（音视频合并），由服务端代理下载",
+    }
 
 
 # ── 工具函数 ──────────────────────────────────────────
@@ -825,7 +933,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>去水印 · 原视频/图片下载（抖音 / 小红书 / TikTok）</title>
+<title>去水印 · 原视频/图片下载（抖音 / 小红书 / TikTok / YouTube）</title>
 <style>
   :root {
     --bg: #0f0f13;
@@ -1132,19 +1240,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="logo-icon">🎬</div>
       <span>去水印下载</span>
     </div>
-    <p class="subtitle">抖音 / 小红书 · 粘贴链接，一键获取无水印原视频/原图</p>
+    <p class="subtitle">抖音 / 小红书 / TikTok / YouTube · 粘贴链接，一键获取无水印原视频/原图</p>
   </div>
 
   <div class="platform-tabs">
     <div class="platform-tab active" id="tab-douyin" onclick="setPlatform('douyin')">🎵 抖音</div>
     <div class="platform-tab" id="tab-xhs" onclick="setPlatform('xhs')">📕 小红书</div>
+    <div class="platform-tab" id="tab-tiktok" onclick="setPlatform('tiktok')">🎬 TikTok</div>
+    <div class="platform-tab" id="tab-youtube" onclick="setPlatform('youtube')">▶️ YouTube</div>
   </div>
 
   <div class="input-card">
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书 / TikTok 分享链接或完整分享文本..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书 / TikTok / YouTube 分享链接或完整分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
@@ -1177,7 +1287,11 @@ let currentRawUrl = '';  // 保存用户原始输入，供 TikTok 重新获取�
 
 urlInput.addEventListener('input', () => {
   const v = urlInput.value.trim().toLowerCase();
-  if (v.includes('xiaohongshu') || v.includes('xhslink') || v.includes('xhs.cn')) {
+  if (v.includes('youtube') || v.includes('youtu.be')) {
+    if (platform !== 'youtube') setPlatform('youtube');
+  } else if (v.includes('tiktok')) {
+    if (platform !== 'tiktok') setPlatform('tiktok');
+  } else if (v.includes('xiaohongshu') || v.includes('xhslink') || v.includes('xhs.cn')) {
     if (platform !== 'xhs') setPlatform('xhs');
   } else if (v.includes('douyin') || v.includes('iesdouyin')) {
     if (platform !== 'douyin') setPlatform('douyin');
@@ -1192,15 +1306,22 @@ function setPlatform(p) {
   tab.classList.add('active');
   if (p === 'xhs') tab.classList.add('xhs');
 
+  btnParse.classList.remove('xhs');
+  urlInput.classList.remove('xhs');
+
   if (p === 'xhs') {
     urlInput.placeholder = '粘贴小红书分享链接...';
     btnParse.classList.add('xhs');
     urlInput.classList.add('xhs');
     qualityRow.classList.add('disabled');
+  } else if (p === 'youtube') {
+    urlInput.placeholder = '粘贴 YouTube 视频链接...';
+    qualityRow.classList.add('disabled');   // YouTube 始终最高清
+  } else if (p === 'tiktok') {
+    urlInput.placeholder = '粘贴 TikTok 视频链接...';
+    qualityRow.classList.add('disabled');   // TikTok 始终原画
   } else {
     urlInput.placeholder = '粘贴抖音分享链接...';
-    btnParse.classList.remove('xhs');
-    urlInput.classList.remove('xhs');
     qualityRow.classList.remove('disabled');
   }
   urlInput.focus();
@@ -1252,20 +1373,23 @@ async function parseLink() {
 
     const isXHS = data.platform === 'xhs';
     const isTikTok = data.platform === 'tiktok';
-    const pClass = isXHS ? 'xhs' : (isTikTok ? 'tiktok' : 'douyin');
-    const pLabel = isXHS ? '小红书' : (isTikTok ? 'TikTok' : '抖音');
-    const pIcon = isXHS ? '📕' : (isTikTok ? '🎬' : '🎵');
+    const isYouTube = data.platform === 'youtube';
+    const pClass = isXHS ? 'xhs' : (isTikTok ? 'tiktok' : (isYouTube ? 'youtube' : 'douyin'));
+    const pLabel = isXHS ? '小红书' : (isTikTok ? 'TikTok' : (isYouTube ? 'YouTube' : '抖音'));
+    const pIcon = isXHS ? '📕' : (isTikTok ? '🎬' : (isYouTube ? '▶️' : '🎵'));
     const isImage = data.note_type === 'image';
 
-    const badge = isTikTok
-      ? `<span style="color:var(--green)">● TikTok 无水印原画</span>`
-      : (isXHS
-        ? (isImage
-          ? `<span style="color:var(--green)">● 原图高清</span>`
-          : `<span style="color:var(--green)">● 原始高清</span>`)
-        : (quality === 'default'
-          ? `<span style="color:var(--green)">● 原始高清</span>`
-          : `<span style="color:var(--text-dim)">● 720P 压缩</span>`));
+    const badge = isYouTube
+      ? `<span style="color:var(--green)">● YouTube 最高清（音视频合并）</span>`
+      : (isTikTok
+        ? `<span style="color:var(--green)">● TikTok 无水印原画</span>`
+        : (isXHS
+          ? (isImage
+            ? `<span style="color:var(--green)">● 原图高清</span>`
+            : `<span style="color:var(--green)">● 原始高清</span>`)
+          : (quality === 'default'
+            ? `<span style="color:var(--green)">● 原始高清</span>`
+            : `<span style="color:var(--text-dim)">● 720P 压缩</span>`)));
 
     if (isImage) {
       // 图文笔记：显示图片画廊
@@ -1325,7 +1449,13 @@ async function parseLink() {
         </div>`;
     } else {
       // 视频笔记
-      const filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
+      let filename;
+      if (isYouTube) {
+        const safeTitle = (data.desc || 'youtube').replace(/[\\/:*?"<>|#]/g, '_').slice(0, 50);
+        filename = (data.author + '_' + safeTitle + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
+      } else {
+        filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
+      }
 
       resultArea.innerHTML = `
         <div class="result-card">
@@ -1359,7 +1489,7 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${isTikTok ? (data.quality_detail || data.file_size_human) : data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`}">
+              <a class="btn-download" href="${isYouTube ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&filename=${encodeURIComponent(filename)}` : (isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`)}">
                 ⬇ 下载
               </a>
             </div>
@@ -1368,6 +1498,7 @@ async function parseLink() {
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
             ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 无水印原画由服务端代理下载（画质为原始画质）。如长时间无响应可重试。</div>' : ''}
+            ${isYouTube ? '<div class="tiktok-tip">提示：YouTube 最高清由服务端用 yt-dlp 抓取并合并音视频，可能需等待十几秒，文件较大属正常。</div>' : ''}
           </div>
         </div>`;
     }
@@ -1451,6 +1582,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if platform == "tiktok":
                 self.tk_proxy_download(dl_url, filename)
+            elif platform == "youtube":
+                self.yt_proxy_download(dl_url, filename)
             else:
                 self._proxy_download(dl_url, filename, platform)
 
@@ -1744,6 +1877,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{enc}")
         self.end_headers()
         self.wfile.write(video_bytes)
+
+    def yt_proxy_download(self, share_url: str, filename: str):
+        """YouTube 最高清下载：服务端用 yt-dlp 抓取并合并音视频，流式返回。
+
+        YouTube 音视频是分离的 DASH 流，必须下载后用 ffmpeg 合并才能得到完整最高清文件，
+        因此无法像抖音/TikTok 那样直接代理直链。ffmpeg 用 imageio-ffmpeg 的静态二进制。
+        """
+        if not HAS_YTDLP:
+            self.send_error(500, "Server missing yt-dlp dependency")
+            return
+
+        url = extract_url_from_text(share_url)
+        tmp_dir = tempfile.mkdtemp(prefix="yt_")
+        out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+
+        # 依次尝试：最高清（任意编码，ffmpeg 合并为 mp4）> 单文件 mp4 > 任意 best
+        formats_to_try = [
+            "bestvideo+bestaudio/best",
+            "best[ext=mp4]/best",
+            "best",
+        ]
+        filepath = None
+        last_err = None
+        try:
+            for fmt in formats_to_try:
+                try:
+                    opts = _yt_base_opts(download=True)
+                    opts.update({
+                        "format": fmt,
+                        "outtmpl": out_tmpl,
+                        "merge_output_format": "mp4",
+                        "noprogress": True,
+                    })
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                    fp = (info.get("requested_downloads") or [{}])[0].get("filepath")
+                    if not fp or not os.path.exists(fp):
+                        files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)
+                                 if os.path.isfile(os.path.join(tmp_dir, f))]
+                        fp = max(files, key=os.path.getsize) if files else None
+                    if fp and os.path.exists(fp):
+                        filepath = fp
+                        break
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            if not filepath:
+                self.send_error(502, f"YouTube download failed: {last_err}")
+                return
+
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            try:
+                self.send_header("Content-Length", os.path.getsize(filepath))
+            except Exception:
+                pass
+            enc = urllib.parse.quote(filename)
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{enc}")
+            self.end_headers()
+            # 分块流式写出，避免大文件（如 4K）占满内存 / 连接中断
+            with open(filepath, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except Exception:
+                        break
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def main():
