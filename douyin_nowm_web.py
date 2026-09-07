@@ -826,7 +826,13 @@ def process_link(share_url: str, quality: str = "default") -> dict:
 
 # ── YouTube 核心逻辑 ──────────────────────────────────────
 
-def _yt_base_opts(download: bool = False) -> dict:
+# YouTube 客户端优先级列表（从服务器/数据中心 IP 访问时）
+# android / ios 使用移动端 API，反爬较松；tv_embedded 能拿 4K 但部分 IP 会被拦；
+# web 端需要 po_token，作为最后兜底。
+_YT_CLIENTS = ["android", "ios", "tv_embedded", "web"]
+
+
+def _yt_base_opts(download: bool = False, client: str = "android") -> dict:
     """yt-dlp 通用选项。download=True 用于真正下载并合并。"""
     opts = {
         "quiet": True,
@@ -834,18 +840,40 @@ def _yt_base_opts(download: bool = False) -> dict:
         "noplaylist": True,
         "extract_flat": False,
         "nocheckcertificate": True,
-        # 数据中心 IP 常被 YouTube 反爬；tv_embedded 客户端能返回完整分辨率（含 4K），
-        # 且无需 po_token。注意：多个客户端组成的「列表」会被 yt-dlp 降级为最低画质，
-        # 因此这里只用单客户端 tv_embedded。
         "extractor_args": {
             "youtube": {
-                "player_client": "tv_embedded",
+                "player_client": client,
             }
         },
     }
     if FFMPEG_EXE:
         opts["ffmpeg_location"] = FFMPEG_EXE
     return opts
+
+
+def _yt_try_clients(url, action_fn, action_name="extract"):
+    """依次尝试多个 YouTube 客户端，第一个成功即返回结果。
+
+    action_fn(client, opts) -> result
+    遇到 bot 拦截 / 网络错误时自动切换下一个客户端。
+    """
+    last_err = None
+    for client in _YT_CLIENTS:
+        try:
+            opts = _yt_base_opts(download=(action_name == "download"), client=client)
+            return action_fn(client, opts), client
+        except Exception as e:
+            last_err = e
+            err_msg = str(e).lower()
+            # bot 拦截 / 登录要求 / 429 限流 → 换客户端重试
+            if any(kw in err_msg for kw in [
+                "bot", "sign in", "confirm you're not", "429",
+                "too many requests", "forbidden", "concurrent",
+            ]):
+                continue
+            # 其他异常（如 URL 格式错）不重试，直接抛出
+            raise
+    raise ValueError(f"YouTube {action_name} 失败（所有客户端均被拦截）: {last_err}")
 
 
 def process_youtube(share_url: str, quality: str = "best") -> dict:
@@ -859,16 +887,14 @@ def process_youtube(share_url: str, quality: str = "best") -> dict:
 
     url = extract_url_from_text(share_url)
 
-    # 探测最佳格式（不下载），用于展示分辨率/大小。
-    # 注意：YouTube 高清流多为 vp9/webm，不能限定 ext=mp4，否则最高只到 360p。
-    probe_opts = _yt_base_opts()
-    probe_opts.update({
-        "simulate": True,
-        "format": "bestvideo+bestaudio/best",
-    })
+    def _probe(client, opts):
+        po = dict(opts)
+        po.update({"simulate": True, "format": "bestvideo+bestaudio/best"})
+        with yt_dlp.YoutubeDL(po) as ydl:
+            return ydl.extract_info(url, download=False)
+
     try:
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info, used_client = _yt_try_clients(url, _probe, action_name="extract")
     except Exception as e:
         raise ValueError(f"YouTube 解析失败（可能被反爬拦截，可重试或换链接）: {e}")
 
@@ -908,7 +934,7 @@ def process_youtube(share_url: str, quality: str = "best") -> dict:
         "file_size_human": format_size(size) if size else "服务端代理下载",
         "file_size": size,
         "content_type": "video/mp4",
-        "note": "YouTube 最高清（音视频合并），由服务端代理下载",
+        "note": f"YouTube 最高清（音视频合并，客户端:{used_client}），由服务端代理下载",
     }
 
 
@@ -1883,6 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
 
         YouTube 音视频是分离的 DASH 流，必须下载后用 ffmpeg 合并才能得到完整最高清文件，
         因此无法像抖音/TikTok 那样直接代理直链。ffmpeg 用 imageio-ffmpeg 的静态二进制。
+        多客户端自动重试：android → ios → tv_embedded → web
         """
         if not HAS_YTDLP:
             self.send_error(500, "Server missing yt-dlp dependency")
@@ -1898,31 +1925,49 @@ class Handler(BaseHTTPRequestHandler):
             "best[ext=mp4]/best",
             "best",
         ]
+
+        def _download(client, opts):
+            """在指定客户端下尝试下载，返回 (info, filepath) 或抛异常。"""
+            for fmt in formats_to_try:
+                po = dict(opts)
+                po.update({
+                    "format": fmt,
+                    "outtmpl": out_tmpl,
+                    "merge_output_format": "mp4",
+                    "noprogress": True,
+                })
+                with yt_dlp.YoutubeDL(po) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                fp = (info.get("requested_downloads") or [{}])[0].get("filepath")
+                if not fp or not os.path.exists(fp):
+                    files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)
+                             if os.path.isfile(os.path.join(tmp_dir, f))]
+                    fp = max(files, key=os.path.getsize) if files else None
+                if fp and os.path.exists(fp):
+                    return info, fp
+            raise Exception("所有格式均下载失败")
+
         filepath = None
         last_err = None
         try:
-            for fmt in formats_to_try:
+            # 多客户端重试：每个客户端内再遍历格式列表
+            for client in _YT_CLIENTS:
                 try:
-                    opts = _yt_base_opts(download=True)
-                    opts.update({
-                        "format": fmt,
-                        "outtmpl": out_tmpl,
-                        "merge_output_format": "mp4",
-                        "noprogress": True,
-                    })
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    fp = (info.get("requested_downloads") or [{}])[0].get("filepath")
-                    if not fp or not os.path.exists(fp):
-                        files = [os.path.join(tmp_dir, f) for f in os.listdir(tmp_dir)
-                                 if os.path.isfile(os.path.join(tmp_dir, f))]
-                        fp = max(files, key=os.path.getsize) if files else None
+                    opts = _yt_base_opts(download=True, client=client)
+                    _, fp = _download(client, opts)
                     if fp and os.path.exists(fp):
                         filepath = fp
                         break
                 except Exception as e:
                     last_err = e
-                    continue
+                    err_msg = str(e).lower()
+                    if any(kw in err_msg for kw in [
+                        "bot", "sign in", "confirm you're not", "429",
+                        "too many requests", "forbidden", "concurrent",
+                    ]):
+                        continue
+                    # 非反爬类错误直接终止
+                    break
 
             if not filepath:
                 self.send_error(502, f"YouTube download failed: {last_err}")
