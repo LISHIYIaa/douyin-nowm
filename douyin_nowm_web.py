@@ -827,25 +827,29 @@ def process_link(share_url: str, quality: str = "default") -> dict:
 # ── YouTube 核心逻辑 ──────────────────────────────────────
 
 # YouTube 客户端优先级列表（从服务器/数据中心 IP 访问时）
-# android / ios 使用移动端 API，反爬较松；tv_embedded 能拿 4K 但部分 IP 会被拦；
-# web 端需要 po_token，作为最后兜底。
-_YT_CLIENTS = ["android", "ios", "tv_embedded", "web"]
+# None = 使用 yt-dlp 默认客户端选择（配合 bgutil PO Token 插件自动供给 token，
+# 这是数据中心 IP 唯一稳定的方案）；其余为无 token 时的手动兜底。
+_YT_CLIENTS = [None, "tv_embedded", "android", "ios", "mweb", "web"]
 
 
-def _yt_base_opts(download: bool = False, client: str = "android") -> dict:
-    """yt-dlp 通用选项。download=True 用于真正下载并合并。"""
+def _yt_base_opts(download: bool = False, client=None) -> dict:
+    """yt-dlp 通用选项。download=True 用于真正下载并合并。
+
+    client=None 表示不强制指定客户端（让 yt-dlp 默认策略 + PO Token 插件工作）。
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "extract_flat": False,
         "nocheckcertificate": True,
-        "extractor_args": {
+    }
+    if client:
+        opts["extractor_args"] = {
             "youtube": {
                 "player_client": client,
             }
-        },
-    }
+        }
     if FFMPEG_EXE:
         opts["ffmpeg_location"] = FFMPEG_EXE
     return opts
@@ -934,7 +938,7 @@ def process_youtube(share_url: str, quality: str = "best") -> dict:
         "file_size_human": format_size(size) if size else "服务端代理下载",
         "file_size": size,
         "content_type": "video/mp4",
-        "note": f"YouTube 最高清（音视频合并，客户端:{used_client}），由服务端代理下载",
+        "note": f"YouTube 最高清（音视频合并，客户端:{used_client or 'default+pot'}），由服务端代理下载",
     }
 
 

@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 .workbuddy/
 *.pyc
+bgutil/server/node_modules/
+bgutil/server/build/
+node-runtime/
