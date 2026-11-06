@@ -326,6 +326,37 @@ def dy_probe_url(url: str) -> dict:
                 "content_length": total}
 
 
+def probe_browser_direct(url: str) -> tuple:
+    """模拟「浏览器点击直连」的请求：桌面 UA + 不发送 Referer。
+
+    返回 (是否可用, Content-Length, Content-Type)。
+    抖音 CDN 对带外部 Referer 的请求会返回 403，浏览器直连能否成功取决于此，
+    因此这里用与浏览器一致的头去探测，前端据此决定主按钮走直连还是中转。
+    """
+    headers = {
+        "User-Agent": DESKTOP_UA,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        # 关键：不带 Referer，模拟地址栏直接访问
+    }
+    for method in ("HEAD", "GET"):
+        try:
+            req = urllib.request.Request(url, headers=headers, method=method)
+            resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=15)
+            ok = 200 <= resp.status < 400
+            length = int(resp.headers.get("Content-Length", 0) or 0)
+            ctype = resp.headers.get("Content-Type", "")
+            if method == "GET":
+                resp.read(1)
+            if ok and (length or ctype):
+                return True, length, ctype
+            if ok:
+                return True, length, ctype
+        except Exception:
+            continue
+    return False, 0, ""
+
+
 def process_douyin(share_url: str, quality: str = "default") -> dict:
     # Step 1: 解析链接，获取视频 ID
     page_url, video_id = dy_resolve_share_url(share_url)
@@ -395,6 +426,7 @@ def process_douyin(share_url: str, quality: str = "default") -> dict:
     else:
         dl_url = info["download_url"]
     probe = dy_probe_url(dl_url)
+    direct_ok, direct_len, direct_ctype = probe_browser_direct(dl_url)
     return {
         "platform": "douyin",
         "ok": True,
@@ -410,9 +442,10 @@ def process_douyin(share_url: str, quality: str = "default") -> dict:
         "cover_url": info["cover_url"],
         "pub_date": info["pub_date"],
         "download_url": dl_url,
-        "file_size": probe["content_length"],
-        "file_size_human": format_size(probe["content_length"]),
-        "content_type": probe["content_type"],
+        "file_size": probe["content_length"] or direct_len,
+        "file_size_human": format_size(probe["content_length"] or direct_len),
+        "content_type": probe["content_type"] or direct_ctype,
+        "direct_ok": direct_ok,
     }
 
 
@@ -631,6 +664,7 @@ def process_xhs(share_url: str) -> dict:
 
     if info["note_type"] == "video":
         probe = xhs_probe_url(info["download_url"])
+        direct_ok, direct_len, direct_ctype = probe_browser_direct(info["download_url"])
         return {
             "platform": "xhs",
             "ok": True,
@@ -647,9 +681,10 @@ def process_xhs(share_url: str) -> dict:
             "cover_url": info["cover_url"],
             "pub_date": info["pub_date"],
             "download_url": info["download_url"],
-            "file_size": probe["content_length"],
-            "file_size_human": format_size(probe["content_length"]),
-            "content_type": probe["content_type"],
+            "file_size": probe["content_length"] or direct_len,
+            "file_size_human": format_size(probe["content_length"] or direct_len),
+            "content_type": probe["content_type"] or direct_ctype,
+            "direct_ok": direct_ok,
             "xsec_token": xsec_token,
         }
     else:
@@ -1428,7 +1463,7 @@ async function parseLink() {
               <span class="img-dim">${img.width}x${img.height}</span>
               <span class="img-size">${img.file_size_human}</span>
             </div>
-            <a class="btn-img-download" href="${img.url}" download="${imgFilename}" target="_blank" rel="noopener" title="浏览器直连 CDN，速度快">⬇</a>
+            <a class="btn-img-download" href="${img.url}" download="${imgFilename}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" title="浏览器直连 CDN 下载原图，速度快">⬇</a>
           </div>`;
       });
 
@@ -1476,6 +1511,16 @@ async function parseLink() {
       // 视频笔记
       let filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
 
+      // 直连是否可行由后端用「浏览器同款请求（桌面 UA、不带 Referer）」探测得出；
+      // 抖音 CDN 对带外部 Referer 的请求返回 403，此时主按钮自动切到中转。
+      const directOk = data.direct_ok !== false;
+      const relayHref = `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`;
+      const directBtn = `<a class="btn-${directOk ? 'download' : 'direct'}" href="${data.download_url}" download="${filename}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" title="浏览器直连源站 CDN，不经服务器中转，速度快">⚡ 直连下载</a>`;
+      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，兼容性最好（直连 403 时用这个）">🛰 中转</a>`;
+      const tipText = directOk
+        ? '⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上。若打开后是播放画面，右键「视频另存为」即可；若提示 403 请改用「🛰 中转」。'
+        : '该视频源站不允许浏览器直连（会返回 403），已默认走「🛰 中转」，速度受服务器带宽限制。也可点「⚡ 直连下载」自己试一次。';
+
       resultArea.innerHTML = `
         <div class="result-card">
           ${data.cover_url ? `<img class="result-cover" src="${data.cover_url}" alt="cover" referrerpolicy="no-referrer">` : ''}
@@ -1508,18 +1553,14 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${data.download_url}" download="${filename}" target="_blank" rel="noopener" title="浏览器直连源站 CDN，不经服务器中转，国内速度快很多">
-                ⚡ 直连下载
-              </a>
-              <a class="btn-direct" href="/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}" title="直连失败（403/播放不下载）时用这个，走服务器中转但速度较慢">
-                🛰 中转
-              </a>
+              ${directBtn}
+              ${relayBtn}
             </div>
             <div class="copy-row">
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
-            <div class="tiktok-tip">⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上。若点了没反应或提示 403，请用「🛰 中转」。</div>
+            <div class="tiktok-tip">${tipText}</div>
           </div>
         </div>`;
     }
