@@ -2,8 +2,8 @@ services:
   - type: web
     name: douyin-nowm
     runtime: python
-    buildCommand: pip install -r requirements.txt && curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz -o /tmp/node.tar.xz && mkdir -p node-runtime && tar -xJf /tmp/node.tar.xz -C node-runtime --strip-components=1 && cd bgutil/server && ../../node-runtime/bin/npm ci --no-audit --no-fund && ../../node-runtime/bin/npx tsc
-    startCommand: bash start.sh
+    buildCommand: pip install -r requirements.txt
+    startCommand: python douyin_nowm_web.py
     envVars:
       - key: PORT
         value: 10000

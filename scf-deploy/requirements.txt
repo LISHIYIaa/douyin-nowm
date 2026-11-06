@@ -1,6 +1,2 @@
-# TikTok 下载需要 curl_cffi 模拟浏览器 TLS 指纹，绕过 Akamai 反爬
+# 抖音 / 小红书 解析与下载所需依赖
 curl_cffi==0.16.2
-
-# YouTube 下载：yt-dlp 负责解析/抓取，imageio-ffmpeg 提供静态 ffmpeg 用于合并最高清音视频
-yt-dlp
-imageio-ffmpeg

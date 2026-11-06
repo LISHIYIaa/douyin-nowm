@@ -97,17 +97,13 @@ def extract_url_from_text(text: str) -> str:
 # ── 平台检测 ──────────────────────────────────────────
 
 def detect_platform(url: str) -> str:
-    """根据 URL 判断平台：douyin / xhs / tiktok / youtube"""
+    """根据 URL 判断平台：douyin / xhs"""
     lower = url.lower()
-    if any(k in lower for k in ["youtube.com", "youtu.be", "youtube-nocookie.com", "youtu.be/"]):
-        return "youtube"
     if any(k in lower for k in ["douyin.com", "iesdouyin.com", "v.douyin.com"]):
         return "douyin"
     if any(k in lower for k in ["xiaohongshu.com", "xhslink.com", "xhs.cn"]):
         return "xhs"
-    if any(k in lower for k in ["tiktok.com", "tiktokcdn.com", "vm.tiktok.com", "vt.tiktok.com"]):
-        return "tiktok"
-    raise ValueError("无法识别链接平台，目前支持抖音、小红书、TikTok 和 YouTube")
+    raise ValueError("无法识别链接平台，目前支持抖音和小红书")
 
 
 # ── 抖音核心逻辑 ──────────────────────────────────────
@@ -817,11 +813,7 @@ def process_link(share_url: str, quality: str = "default") -> dict:
         return process_douyin(url, quality)
     elif platform == "xhs":
         return process_xhs(url)
-    elif platform == "tiktok":
-        return process_tiktok(url)
-    elif platform == "youtube":
-        return process_youtube(url, quality)
-    raise ValueError("不支持的平台")
+    raise ValueError("不支持的平台（目前仅支持抖音和小红书）")
 
 
 # ── YouTube 核心逻辑 ──────────────────────────────────────
@@ -873,6 +865,8 @@ def _yt_try_clients(url, action_fn, action_name="extract"):
             if any(kw in err_msg for kw in [
                 "bot", "sign in", "confirm you're not", "429",
                 "too many requests", "forbidden", "concurrent",
+                "failed to extract any player response", "unable to extract",
+                "player response", "no video formats", "requested format",
             ]):
                 continue
             # 其他异常（如 URL 格式错）不重试，直接抛出
@@ -963,7 +957,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>去水印 · 原视频/图片下载（抖音 / 小红书 / TikTok / YouTube）</title>
+<title>去水印 · 原视频/图片下载（抖音 / 小红书）</title>
 <style>
   :root {
     --bg: #0f0f13;
@@ -1289,21 +1283,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="logo-icon">🎬</div>
       <span>去水印下载</span>
     </div>
-    <p class="subtitle">抖音 / 小红书 / TikTok / YouTube · 粘贴链接，一键获取无水印原视频/原图</p>
+    <p class="subtitle">抖音 / 小红书 · 粘贴链接，一键获取无水印原视频/原图</p>
   </div>
 
   <div class="platform-tabs">
     <div class="platform-tab active" id="tab-douyin" onclick="setPlatform('douyin')">🎵 抖音</div>
     <div class="platform-tab" id="tab-xhs" onclick="setPlatform('xhs')">📕 小红书</div>
-    <div class="platform-tab" id="tab-tiktok" onclick="setPlatform('tiktok')">🎬 TikTok</div>
-    <div class="platform-tab" id="tab-youtube" onclick="setPlatform('youtube')">▶️ YouTube</div>
   </div>
 
   <div class="input-card">
     <div class="input-row">
       <div class="input-wrap">
         <span class="input-icon">🔗</span>
-        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书 / TikTok / YouTube 分享链接或完整分享文本..." autofocus>
+        <input type="text" id="url-input" placeholder="粘贴抖音 / 小红书分享链接或完整分享文本..." autofocus>
       </div>
       <button class="btn-parse" id="btn-parse" onclick="parseLink()">解析</button>
     </div>
@@ -1336,11 +1328,7 @@ let currentRawUrl = '';  // 保存用户原始输入，供 TikTok 重新获取�
 
 urlInput.addEventListener('input', () => {
   const v = urlInput.value.trim().toLowerCase();
-  if (v.includes('youtube') || v.includes('youtu.be')) {
-    if (platform !== 'youtube') setPlatform('youtube');
-  } else if (v.includes('tiktok')) {
-    if (platform !== 'tiktok') setPlatform('tiktok');
-  } else if (v.includes('xiaohongshu') || v.includes('xhslink') || v.includes('xhs.cn')) {
+  if (v.includes('xiaohongshu') || v.includes('xhslink') || v.includes('xhs.cn')) {
     if (platform !== 'xhs') setPlatform('xhs');
   } else if (v.includes('douyin') || v.includes('iesdouyin')) {
     if (platform !== 'douyin') setPlatform('douyin');
@@ -1363,12 +1351,6 @@ function setPlatform(p) {
     btnParse.classList.add('xhs');
     urlInput.classList.add('xhs');
     qualityRow.classList.add('disabled');
-  } else if (p === 'youtube') {
-    urlInput.placeholder = '粘贴 YouTube 视频链接...';
-    qualityRow.classList.add('disabled');   // YouTube 始终最高清
-  } else if (p === 'tiktok') {
-    urlInput.placeholder = '粘贴 TikTok 视频链接...';
-    qualityRow.classList.add('disabled');   // TikTok 始终原画
   } else {
     urlInput.placeholder = '粘贴抖音分享链接...';
     qualityRow.classList.remove('disabled');
@@ -1421,24 +1403,18 @@ async function parseLink() {
     if (!data.ok) throw new Error(data.error || '解析失败');
 
     const isXHS = data.platform === 'xhs';
-    const isTikTok = data.platform === 'tiktok';
-    const isYouTube = data.platform === 'youtube';
-    const pClass = isXHS ? 'xhs' : (isTikTok ? 'tiktok' : (isYouTube ? 'youtube' : 'douyin'));
-    const pLabel = isXHS ? '小红书' : (isTikTok ? 'TikTok' : (isYouTube ? 'YouTube' : '抖音'));
-    const pIcon = isXHS ? '📕' : (isTikTok ? '🎬' : (isYouTube ? '▶️' : '🎵'));
+    const pClass = isXHS ? 'xhs' : 'douyin';
+    const pLabel = isXHS ? '小红书' : '抖音';
+    const pIcon = isXHS ? '📕' : '🎵';
     const isImage = data.note_type === 'image';
 
-    const badge = isYouTube
-      ? `<span style="color:var(--green)">● YouTube 最高清（音视频合并）</span>`
-      : (isTikTok
-        ? `<span style="color:var(--green)">● TikTok 无水印原画</span>`
-        : (isXHS
-          ? (isImage
-            ? `<span style="color:var(--green)">● 原图高清</span>`
-            : `<span style="color:var(--green)">● 原始高清</span>`)
-          : (quality === 'default'
-            ? `<span style="color:var(--green)">● 原始高清</span>`
-            : `<span style="color:var(--text-dim)">● 720P 压缩</span>`)));
+    const badge = isXHS
+      ? (isImage
+        ? `<span style="color:var(--green)">● 原图高清</span>`
+        : `<span style="color:var(--green)">● 原始高清</span>`)
+      : (quality === 'default'
+        ? `<span style="color:var(--green)">● 原始高清</span>`
+        : `<span style="color:var(--text-dim)">● 720P 压缩</span>`);
 
     if (isImage) {
       // 图文笔记：显示图片画廊
@@ -1452,7 +1428,7 @@ async function parseLink() {
               <span class="img-dim">${img.width}x${img.height}</span>
               <span class="img-size">${img.file_size_human}</span>
             </div>
-            <a class="btn-img-download" href="/api/download?url=${encodeURIComponent(img.url)}&platform=xhs&filename=${encodeURIComponent(imgFilename)}" download>⬇</a>
+            <a class="btn-img-download" href="${img.url}" download="${imgFilename}" target="_blank" rel="noopener" title="浏览器直连 CDN，速度快">⬇</a>
           </div>`;
       });
 
@@ -1498,13 +1474,7 @@ async function parseLink() {
         </div>`;
     } else {
       // 视频笔记
-      let filename;
-      if (isYouTube) {
-        const safeTitle = (data.desc || 'youtube').replace(/[\\/:*?"<>|#]/g, '_').slice(0, 50);
-        filename = (data.author + '_' + safeTitle + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
-      } else {
-        filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
-      }
+      let filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
 
       resultArea.innerHTML = `
         <div class="result-card">
@@ -1536,21 +1506,20 @@ async function parseLink() {
             <div class="download-bar">
               <div class="download-info">
                 <div class="download-quality">${badge}</div>
-                <div class="download-size">${isTikTok ? (data.quality_detail || data.file_size_human) : data.file_size_human} · ${data.content_type}</div>
+                <div class="download-size">${data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${isYouTube ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&maxh=1080&filename=${encodeURIComponent(filename)}` : (isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`)}">
-                ⬇ 下载${isYouTube ? ' (1080P)' : ''}
+              <a class="btn-download" href="${data.download_url}" download="${filename}" target="_blank" rel="noopener" title="浏览器直连源站 CDN，不经服务器中转，国内速度快很多">
+                ⚡ 直连下载
               </a>
-              ${isYouTube ? `<a class="btn-direct" href="/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&filename=${encodeURIComponent(filename)}" title="4K 原画体积大（可能数百 MB），免费服务器中转较慢；急需的话用这个">⚡ 最高清</a>` : ''}
-              ${(!isTikTok && !isYouTube) ? `<a class="btn-direct" href="${encodeURI(data.download_url)}" target="_blank" rel="noopener" title="浏览器直连源站 CDN（国内速度更快，不经服务器中转）；若直接播放了视频，请右键另存为">⚡ 直连</a>` : ''}
+              <a class="btn-direct" href="/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}" title="直连失败（403/播放不下载）时用这个，走服务器中转但速度较慢">
+                🛰 中转
+              </a>
             </div>
             <div class="copy-row">
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
-            ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 无水印原画由服务端代理下载（画质为原始画质）。如长时间无响应可重试。</div>' : ''}
-            ${isYouTube ? '<div class="tiktok-tip">下载慢？4K 原画常有数百 MB，经海外服务器中转速度受限。默认走 1080P（体积小 4~5 倍，快很多）；确实要原画请点「⚡ 最高清」。</div>' : ''}
-            ${(!isTikTok && !isYouTube) ? '<div class="tiktok-tip">下载慢？点「⚡ 直连」由浏览器直接从源站 CDN 拉取，不经过海外服务器中转，国内通常快很多。</div>' : ''}
+            <div class="tiktok-tip">⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上。若点了没反应或提示 403，请用「🛰 中转」。</div>
           </div>
         </div>`;
     }
