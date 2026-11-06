@@ -827,25 +827,29 @@ def process_link(share_url: str, quality: str = "default") -> dict:
 # ── YouTube 核心逻辑 ──────────────────────────────────────
 
 # YouTube 客户端优先级列表（从服务器/数据中心 IP 访问时）
-# android / ios 使用移动端 API，反爬较松；tv_embedded 能拿 4K 但部分 IP 会被拦；
-# web 端需要 po_token，作为最后兜底。
-_YT_CLIENTS = ["android", "ios", "tv_embedded", "web"]
+# None = 使用 yt-dlp 默认客户端选择（配合 bgutil PO Token 插件自动供给 token，
+# 这是数据中心 IP 唯一稳定的方案）；其余为无 token 时的手动兜底。
+_YT_CLIENTS = [None, "tv_embedded", "android", "ios", "mweb", "web"]
 
 
-def _yt_base_opts(download: bool = False, client: str = "android") -> dict:
-    """yt-dlp 通用选项。download=True 用于真正下载并合并。"""
+def _yt_base_opts(download: bool = False, client=None) -> dict:
+    """yt-dlp 通用选项。download=True 用于真正下载并合并。
+
+    client=None 表示不强制指定客户端（让 yt-dlp 默认策略 + PO Token 插件工作）。
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "extract_flat": False,
         "nocheckcertificate": True,
-        "extractor_args": {
+    }
+    if client:
+        opts["extractor_args"] = {
             "youtube": {
                 "player_client": client,
             }
-        },
-    }
+        }
     if FFMPEG_EXE:
         opts["ffmpeg_location"] = FFMPEG_EXE
     return opts
@@ -934,7 +938,7 @@ def process_youtube(share_url: str, quality: str = "best") -> dict:
         "file_size_human": format_size(size) if size else "服务端代理下载",
         "file_size": size,
         "content_type": "video/mp4",
-        "note": f"YouTube 最高清（音视频合并，客户端:{used_client}），由服务端代理下载",
+        "note": f"YouTube 最高清（音视频合并，客户端:{used_client or 'default+pot'}），由服务端代理下载",
     }
 
 
@@ -1184,6 +1188,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .btn-download:hover { opacity: .85; }
   .btn-download:active { transform: scale(.95); }
+  /* 直连下载（浏览器直连源站 CDN，国内速度更快） */
+  .btn-direct {
+    background: transparent;
+    color: var(--green);
+    border: 1px solid var(--green);
+    border-radius: 10px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    transition: opacity .2s, transform .1s;
+  }
+  .btn-direct:hover { opacity: .8; }
+  .btn-direct:active { transform: scale(.95); }
 
   /* Copy link */
   .copy-row {
@@ -1515,16 +1538,19 @@ async function parseLink() {
                 <div class="download-quality">${badge}</div>
                 <div class="download-size">${isTikTok ? (data.quality_detail || data.file_size_human) : data.file_size_human} · ${data.content_type}</div>
               </div>
-              <a class="btn-download" href="${isYouTube ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&filename=${encodeURIComponent(filename)}` : (isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`)}">
-                ⬇ 下载
+              <a class="btn-download" href="${isYouTube ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&maxh=1080&filename=${encodeURIComponent(filename)}` : (isTikTok ? `/api/download?url=${encodeURIComponent(data.download_url)}&platform=tiktok&filename=${encodeURIComponent(filename)}` : `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`)}">
+                ⬇ 下载${isYouTube ? ' (1080P)' : ''}
               </a>
+              ${isYouTube ? `<a class="btn-direct" href="/api/download?url=${encodeURIComponent(data.download_url)}&platform=youtube&filename=${encodeURIComponent(filename)}" title="4K 原画体积大（可能数百 MB），免费服务器中转较慢；急需的话用这个">⚡ 最高清</a>` : ''}
+              ${(!isTikTok && !isYouTube) ? `<a class="btn-direct" href="${encodeURI(data.download_url)}" target="_blank" rel="noopener" title="浏览器直连源站 CDN（国内速度更快，不经服务器中转）；若直接播放了视频，请右键另存为">⚡ 直连</a>` : ''}
             </div>
             <div class="copy-row">
               <input class="copy-input" id="dl-url" value="${data.download_url}" readonly>
               <button class="btn-copy" onclick="copyLink(this)">复制链接</button>
             </div>
             ${isTikTok ? '<div class="tiktok-tip">提示：TikTok 无水印原画由服务端代理下载（画质为原始画质）。如长时间无响应可重试。</div>' : ''}
-            ${isYouTube ? '<div class="tiktok-tip">提示：YouTube 最高清由服务端用 yt-dlp 抓取并合并音视频，可能需等待十几秒，文件较大属正常。</div>' : ''}
+            ${isYouTube ? '<div class="tiktok-tip">下载慢？4K 原画常有数百 MB，经海外服务器中转速度受限。默认走 1080P（体积小 4~5 倍，快很多）；确实要原画请点「⚡ 最高清」。</div>' : ''}
+            ${(!isTikTok && !isYouTube) ? '<div class="tiktok-tip">下载慢？点「⚡ 直连」由浏览器直接从源站 CDN 拉取，不经过海外服务器中转，国内通常快很多。</div>' : ''}
           </div>
         </div>`;
     }
@@ -1609,7 +1635,8 @@ class Handler(BaseHTTPRequestHandler):
             if platform == "tiktok":
                 self.tk_proxy_download(dl_url, filename)
             elif platform == "youtube":
-                self.yt_proxy_download(dl_url, filename)
+                maxh = qs.get("maxh", [""])[0]
+                self.yt_proxy_download(dl_url, filename, maxh)
             else:
                 self._proxy_download(dl_url, filename, platform)
 
@@ -1904,12 +1931,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(video_bytes)
 
-    def yt_proxy_download(self, share_url: str, filename: str):
+    def yt_proxy_download(self, share_url: str, filename: str, maxh: str = ""):
         """YouTube 最高清下载：服务端用 yt-dlp 抓取并合并音视频，流式返回。
 
         YouTube 音视频是分离的 DASH 流，必须下载后用 ffmpeg 合并才能得到完整最高清文件，
         因此无法像抖音/TikTok 那样直接代理直链。ffmpeg 用 imageio-ffmpeg 的静态二进制。
-        多客户端自动重试：android → ios → tv_embedded → web
+        多客户端自动重试：default(PO Token) → tv_embedded → android → ios → web
+
+        maxh: 限制最高分辨率（如 "1080"）。4K 文件常有数百 MB，经免费服务器跨境中转
+        非常慢，因此默认前端传 1080 以大幅缩短等待时间；留空表示不限（最高清）。
         """
         if not HAS_YTDLP:
             self.send_error(500, "Server missing yt-dlp dependency")
@@ -1919,10 +1949,12 @@ class Handler(BaseHTTPRequestHandler):
         tmp_dir = tempfile.mkdtemp(prefix="yt_")
         out_tmpl = os.path.join(tmp_dir, "%(id)s.%(ext)s")
 
+        # 分辨率限制（仅在 maxh 为合法数字时生效）
+        hf = f"[height<={int(maxh)}]" if maxh.isdigit() else ""
         # 依次尝试：最高清（任意编码，ffmpeg 合并为 mp4）> 单文件 mp4 > 任意 best
         formats_to_try = [
-            "bestvideo+bestaudio/best",
-            "best[ext=mp4]/best",
+            f"bestvideo{hf}+bestaudio/best{hf}/best",
+            f"best[ext=mp4]{hf}/best",
             "best",
         ]
 
