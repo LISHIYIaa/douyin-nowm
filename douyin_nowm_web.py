@@ -357,6 +357,31 @@ def probe_browser_direct(url: str) -> tuple:
     return False, 0, ""
 
 
+def resolve_final_url(url: str, timeout: int = 15) -> str:
+    """把重定向端点（如 aweme.snssdk.com/aweme/v1/play/）解析成最终 CDN 直链。
+
+    浏览器用 fetch/xhr 跨域下载时，要求重定向链上「每一跳」都带 CORS 头。
+    snssdk 的 play 端点本身不带 access-control-allow-origin，浏览器会在第一跳就报
+    CORS 错误；而最终的 douyinvod CDN 直链带 `access-control-allow-origin: *`。
+    因此这里先在服务端跟随 302 拿到最终直链，前端再去跨域拉流。
+    """
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": DESKTOP_UA,
+            "Accept": "*/*",
+            "Range": "bytes=0-0",
+        })
+        resp = urllib.request.urlopen(req, context=SSL_CTX, timeout=timeout)
+        final = resp.geturl() or url
+        try:
+            resp.close()
+        except Exception:
+            pass
+        return final
+    except Exception:
+        return url
+
+
 def process_douyin(share_url: str, quality: str = "default") -> dict:
     # Step 1: 解析链接，获取视频 ID
     page_url, video_id = dy_resolve_share_url(share_url)
@@ -425,6 +450,8 @@ def process_douyin(share_url: str, quality: str = "default") -> dict:
         dl_url = dy_build_download_url(info["video_uri"], quality)
     else:
         dl_url = info["download_url"]
+    # 关键：把 snssdk 重定向端点换成最终 CDN 直链，浏览器才能跨域直连下载
+    dl_url = resolve_final_url(dl_url)
     probe = dy_probe_url(dl_url)
     direct_ok, direct_len, direct_ctype = probe_browser_direct(dl_url)
     return {
@@ -1208,6 +1235,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 10px 20px;
     font-size: 14px;
     font-weight: 700;
+    font-family: inherit;
     cursor: pointer;
     text-decoration: none;
     display: inline-flex;
@@ -1215,6 +1243,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 6px;
     transition: opacity .2s, transform .1s;
   }
+  .btn-download:disabled, .btn-direct:disabled { opacity: .7; cursor: default; }
   .btn-download:hover { opacity: .85; }
   .btn-download:active { transform: scale(.95); }
   /* 直连下载（浏览器直连源站 CDN，国内速度更快） */
@@ -1226,6 +1255,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     padding: 9px 14px;
     font-size: 13px;
     font-weight: 600;
+    font-family: inherit;
     cursor: pointer;
     text-decoration: none;
     display: inline-flex;
@@ -1295,6 +1325,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border: none;
     border-radius: 8px;
     font-size: 16px;
+    font-family: inherit;
+    cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1411,6 +1443,90 @@ function formatNum(n) {
   return n.toLocaleString();
 }
 
+// ── 直连下载 ────────────────────────────────────────────────────
+// 跨域的 <a download> 会被浏览器忽略，文件名会变成 URL 里那串哈希，
+// 而且直接跳转只会「在线播放」不会保存。这里自己 fetch 拉流，
+// 再用 blob: URL 触发保存，实现「点一下就自动下载 + 自定义文件名」。
+function attrEnc(s) {
+  return encodeURIComponent(String(s || '')).replace(/'/g, '%27');
+}
+
+async function directDownload(btn) {
+  const url = decodeURIComponent(btn.dataset.url || '');
+  const filename = decodeURIComponent(btn.dataset.name || 'download.mp4');
+  if (!url || btn.dataset.busy === '1') return;
+
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
+  btn.dataset.busy = '1';
+  btn.disabled = true;
+  const setTxt = t => { btn.textContent = t; };
+  const mb = n => (n / 1048576).toFixed(1);
+
+  try {
+    const resp = await fetch(url, {
+      referrerPolicy: 'no-referrer',
+      credentials: 'omit',
+      mode: 'cors',
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+    const total = Number(resp.headers.get('content-length') || 0);
+    let blob = null;
+
+    if (resp.body && resp.body.getReader) {
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let loaded = 0, tick = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.length;
+        const now = Date.now();
+        if (now - tick > 200) {
+          tick = now;
+          setTxt(total
+            ? `⏳ ${Math.floor(loaded / total * 100)}%  ${mb(loaded)}/${mb(total)}MB`
+            : `⏳ ${mb(loaded)}MB`);
+        }
+      }
+      blob = new Blob(chunks, { type: resp.headers.get('content-type') || 'application/octet-stream' });
+    } else {
+      blob = await resp.blob();
+    }
+
+    if (!blob.size) throw new Error('文件为空');
+
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = filename;          // 达人名 + 发布时间，由这里决定
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 120000);
+    setTxt('✔ 已保存');
+    clearError();
+  } catch (e) {
+    const relay = btn.dataset.relay || '';
+    if (relay) {
+      setTxt('⚠ 转中转下载…');
+      showError('直连被源站拒绝（' + e.message + '），已自动切换到「🛰 中转」下载，速度会慢一些属正常。');
+      setTimeout(() => { window.location.href = relay; }, 600);
+    } else {
+      setTxt('⚠ 直连失败');
+      showError('下载失败（' + e.message + '）：源站不允许浏览器直连，请点旁边的「🛰 中转」下载。');
+    }
+  } finally {
+    btn.dataset.busy = '0';
+    setTimeout(() => {
+      btn.textContent = btn.dataset.label;
+      btn.disabled = false;
+    }, 2200);
+  }
+}
+
 async function parseLink() {
   const url = urlInput.value.trim();
   if (!url) { showError('请输入视频链接'); return; }
@@ -1455,7 +1571,7 @@ async function parseLink() {
       // 图文笔记：显示图片画廊
       let imgCards = '';
       data.images.forEach((img, i) => {
-        const imgFilename = (data.author + '_' + (data.pub_date || '') + '_' + (i+1) + '.jpg').replace(/[\\/:*?"<>|#]/g, '_');
+        const imgName = (data.author + (data.pub_date ? '_' + data.pub_date : '') + '_' + (i+1) + '.jpg').replace(/[\\/:*?"<>|#]/g, '_');
         imgCards += `
           <div class="img-card">
             <img class="img-thumb" src="${img.url}" alt="图${i+1}" referrerpolicy="no-referrer" loading="lazy">
@@ -1463,7 +1579,7 @@ async function parseLink() {
               <span class="img-dim">${img.width}x${img.height}</span>
               <span class="img-size">${img.file_size_human}</span>
             </div>
-            <a class="btn-img-download" href="${img.url}" download="${imgFilename}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" title="浏览器直连 CDN 下载原图，速度快">⬇</a>
+            <button type="button" class="btn-img-download" data-url="${attrEnc(img.url)}" data-name="${attrEnc(imgName)}" onclick="directDownload(this)" title="点击即自动保存为「${imgName}」">⬇</button>
           </div>`;
       });
 
@@ -1508,17 +1624,19 @@ async function parseLink() {
           </div>
         </div>`;
     } else {
-      // 视频笔记
-      let filename = (data.author + '_' + (data.pub_date || '') + '.mp4').replace(/[\\/:*?"<>|#]/g, '_');
+      // 视频笔记：文件名 = 达人名称 + 发布时间
+      const safeName = s => String(s || '').replace(/[\\/:*?"<>|#]/g, '_').trim();
+      const datePart = safeName(data.pub_date);
+      const filename = (safeName(data.author) || 'video') + (datePart ? '_' + datePart : '') + '.mp4';
 
       // 直连是否可行由后端用「浏览器同款请求（桌面 UA、不带 Referer）」探测得出；
       // 抖音 CDN 对带外部 Referer 的请求返回 403，此时主按钮自动切到中转。
       const directOk = data.direct_ok !== false;
       const relayHref = `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`;
-      const directBtn = `<a class="btn-${directOk ? 'download' : 'direct'}" href="${data.download_url}" download="${filename}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" title="浏览器直连源站 CDN，不经服务器中转，速度快">⚡ 直连下载</a>`;
-      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，兼容性最好（直连 403 时用这个）">🛰 中转</a>`;
+      const directBtn = `<button type="button" class="btn-${directOk ? 'download' : 'direct'}" data-url="${attrEnc(data.download_url)}" data-name="${attrEnc(filename)}" data-relay="${attrEnc(relayHref)}" onclick="directDownload(this)" title="浏览器直连源站 CDN（速度最快），点击即自动保存为「${filename}」">⚡ 直连下载</button>`;
+      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，兼容性最好（直连 403/失败时用这个），同样自动命名为「${filename}」">🛰 中转</a>`;
       const tipText = directOk
-        ? '⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上。若打开后是播放画面，右键「视频另存为」即可；若提示 403 请改用「🛰 中转」。'
+        ? `⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上；点击后自动保存为「${filename}」。若提示失败请改用「🛰 中转」。`
         : '该视频源站不允许浏览器直连（会返回 403），已默认走「🛰 中转」，速度受服务器带宽限制。也可点「⚡ 直连下载」自己试一次。';
 
       resultArea.innerHTML = `
