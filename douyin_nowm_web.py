@@ -504,9 +504,15 @@ def xhs_extract_note_id(url: str) -> str:
     raise ValueError("无法从小红书链接提取笔记 ID")
 
 
-def xhs_fetch_page_html(url: str) -> str:
+def xhs_fetch_page_html(url: str, mobile: bool = True) -> str:
+    """抓取小红书笔记页。
+
+    2026 起 PC 端 SSR 对未登录请求只返回空壳（无 noteDetailMap），
+    而移动端 H5 分享页仍会内联完整笔记数据（noteData.data.noteData），
+    所以默认走移动 UA。
+    """
     req = urllib.request.Request(url, headers={
-        "User-Agent": DESKTOP_UA,
+        "User-Agent": MOBILE_UA if mobile else DESKTOP_UA,
         "Referer": XHS_REFERER,
         "Accept": "text/html,application/xhtml+xml",
         "Accept-Language": "zh-CN,zh;q=0.9",
@@ -529,17 +535,30 @@ def xhs_parse_initial_state(html: str) -> dict:
 
 
 def xhs_extract_note_info(initial_state: dict, note_id: str) -> dict:
-    """从 __INITIAL_STATE__ 中提取笔记信息（视频或图文）"""
-    note_map = initial_state.get("note", {}).get("noteDetailMap", {})
-    note_data = note_map.get(note_id)
-    if not note_data:
-        if note_map:
-            note_id = list(note_map.keys())[0]
-            note_data = note_map[note_id]
-        else:
-            raise ValueError("小红书页面中未找到笔记数据")
+    """从 __INITIAL_STATE__ 中提取笔记信息（视频或图文）。
 
-    note = note_data.get("note", {})
+    兼容两种页面结构：
+      A. PC SSR：state["note"]["noteDetailMap"][note_id]["note"]
+      B. H5 分享页：state["noteData"]["data"]["noteData"]（直接是 note 对象）
+    """
+    note = {}
+
+    note_map = initial_state.get("note", {}).get("noteDetailMap", {})
+    if note_map:
+        entry = note_map.get(note_id) or next(iter(note_map.values()))
+        if isinstance(entry, dict):
+            note = entry.get("note", {}) or {}
+
+    if not note:
+        h5 = (initial_state.get("noteData") or {}).get("data") or {}
+        cand = h5.get("noteData") or {}
+        if isinstance(cand, dict) and cand:
+            note = cand
+            note_id = note.get("noteId") or note_id
+
+    if not note:
+        raise ValueError("小红书页面中未找到笔记数据")
+
     note_type = note.get("type", "normal")  # "video" 或 "normal"（图文）
 
     # 发布时间
@@ -560,12 +579,16 @@ def xhs_extract_note_info(initial_state: dict, note_id: str) -> dict:
         except (TypeError, ValueError):
             return 0
 
+    user = note.get("user") or {}
+    # H5 结构里字段名是 nickName
+    nickname = user.get("nickname") or user.get("nickName") or ""
+
     base = {
         "note_id": note_id,
         "note_type": note_type,
         "title": note.get("title", ""),
         "desc": note.get("desc", ""),
-        "nickname": note.get("user", {}).get("nickname", ""),
+        "nickname": nickname,
         "pub_date": pub_date,
         "liked_count": safe_int(interact.get("likedCount", 0)),
         "comment_count": safe_int(interact.get("commentCount", 0)),
@@ -673,21 +696,18 @@ def process_xhs(share_url: str) -> dict:
     html = xhs_fetch_page_html(page_url)
     state = xhs_parse_initial_state(html)
 
-    # 检查 noteDetailMap 是否有数据（小红书改版后需要 xsec_token）
-    note_map = state.get("note", {}).get("noteDetailMap", {})
-    if not note_map:
-        # 检查是否被重定向到 404 页面
-        if "/404" in html[:5000]:
+    try:
+        info = xhs_extract_note_info(state, note_id)
+    except ValueError:
+        # 页面里没有任何笔记数据：区分「失效」和「需要新 token」两种情况
+        if "/404" in html[:5000] or "页面不存在" in html:
             raise ValueError("该小红书笔记可能已被删除或链接已失效")
-        # 检查 URL 中是否缺少 xsec_token
         if "xsec_token" not in page_url:
             raise ValueError(
                 "小红书改版后需要完整的分享链接（含 xsec_token 参数）。\n"
                 "请在小红书 App 中点击「分享」→「复制链接」，粘贴完整的分享文本。"
             )
         raise ValueError("未能获取小红书笔记数据，链接中的 xsec_token 可能已过期，请重新分享获取新链接")
-
-    info = xhs_extract_note_info(state, note_id)
 
     if info["note_type"] == "video":
         probe = xhs_probe_url(info["download_url"])
@@ -1014,6 +1034,67 @@ def format_duration(ms: int) -> str:
 
 # ── 前端页面 ──────────────────────────────────────────
 
+# Service Worker：把「CDN 直连」包装成浏览器原生下载。
+# 浏览器拦截 /__dl 请求，在这里补上 Content-Disposition 再把流交回去，
+# 于是下载进度/暂停/续传/中文文件名都由浏览器下载器负责，而数据依然直连 CDN。
+SW_JS = r"""/* direct-download service worker */
+const DL_PATH = '/__dl';
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  let url;
+  try { url = new URL(req.url); } catch (e) { return; }
+  if (url.origin !== self.location.origin) return;
+  if (url.pathname !== DL_PATH) return;
+  event.respondWith(handleDownload(url));
+});
+
+async function handleDownload(url) {
+  const p = url.searchParams;
+  const target = p.get('u');
+  const name = p.get('n') || 'download';
+  const fb = p.get('f') || '';
+  if (!target) {
+    return new Response('missing url', { status: 400, headers: { 'Content-Type': 'text/plain' } });
+  }
+
+  try {
+    const resp = await fetch(target, {
+      referrerPolicy: 'no-referrer',
+      credentials: 'omit',
+      mode: 'cors',
+      cache: 'no-store',
+      redirect: 'follow',
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+    const headers = new Headers();
+    headers.set('Content-Type', resp.headers.get('content-type') || 'application/octet-stream');
+    const len = resp.headers.get('content-length');
+    if (len) headers.set('Content-Length', len);
+    headers.set('Content-Disposition', "attachment; filename*=UTF-8''" + encodeURIComponent(name));
+    headers.set('Cache-Control', 'no-store');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    return new Response(resp.body, { status: 200, statusText: 'OK', headers });
+  } catch (err) {
+    // 直连被拒 → 退回服务端中转（同样是原生下载，只是慢一点）
+    if (fb) {
+      try {
+        return Response.redirect(new URL(fb, self.location.origin).href, 302);
+      } catch (e) {}
+    }
+    return new Response('direct download failed: ' + err.message, {
+      status: 502,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
+  }
+}
+"""
+
+
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1172,6 +1253,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 14px;
     margin-top: 16px;
   }
+  /* Tip（下载已交给浏览器时提示） */
+  .tip {
+    background: rgba(37,244,238,.09);
+    border: 1px solid rgba(37,244,238,.28);
+    border-radius: 12px;
+    padding: 14px 16px;
+    color: var(--green);
+    font-size: 13px;
+    line-height: 1.6;
+    margin-top: 16px;
+    animation: slideUp .25s ease;
+  }
+  .tip b { color: var(--text); font-weight: 700; }
 
   /* Result Card */
   .result-card {
@@ -1435,6 +1529,9 @@ function setQuality(q) {
 function showError(msg) {
   errorEl.innerHTML = '<div class="error">⚠️ ' + msg + '</div>';
 }
+function showTip(html) {
+  errorEl.innerHTML = '<div class="tip">' + html + '</div>';
+}
 function clearError() { errorEl.innerHTML = ''; }
 
 function formatNum(n) {
@@ -1443,73 +1540,111 @@ function formatNum(n) {
   return n.toLocaleString();
 }
 
-// ── 直连下载 ────────────────────────────────────────────────────
-// 跨域的 <a download> 会被浏览器忽略，文件名会变成 URL 里那串哈希，
-// 而且直接跳转只会「在线播放」不会保存。这里自己 fetch 拉流，
-// 再用 blob: URL 触发保存，实现「点一下就自动下载 + 自定义文件名」。
+// ── 浏览器原生下载 ──────────────────────────────────────────────
+// 跨域链接的 download 属性会被浏览器忽略（文件名变哈希、只会在线播放），
+// 而后端中转又慢。折中做法：注册一个 Service Worker 拦住同源的 /__dl，
+// 由 SW 去直连 CDN 拉流，再补上 Content-Disposition 交还给浏览器。
+// 这样速度仍是 CDN 直连，但下载/进度/断点/命名全部由浏览器下载器接管。
 function attrEnc(s) {
   return encodeURIComponent(String(s || '')).replace(/'/g, '%27');
+}
+
+// SW 就绪 promise（拿不到就为 null，走下面的 Blob 兜底）
+const swReady = (function () {
+  if (!('serviceWorker' in navigator)) return Promise.resolve(null);
+  try {
+    return navigator.serviceWorker
+      .register('/sw-dl.js', { scope: '/' })
+      .then(() => navigator.serviceWorker.ready)
+      .catch(() => null);
+  } catch (e) { return Promise.resolve(null); }
+})();
+
+function withTimeout(p, ms) {
+  return Promise.race([p, new Promise(r => setTimeout(() => r(null), ms))]);
+}
+
+// 用同源 <a download> 触发；节点必须留在 DOM 里一小会儿，
+// 立刻 remove 会让部分 Chrome 版本把下载标记为「已取消」。
+function triggerNativeDownload(url, filename, relay) {
+  let q = '/__dl?u=' + encodeURIComponent(url) + '&n=' + encodeURIComponent(filename);
+  if (relay) q += '&f=' + encodeURIComponent(relay);
+  const a = document.createElement('a');
+  a.href = q;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { try { a.remove(); } catch (e) {} }, 600000);
+}
+
+// 兜底：SW 不可用时，自己拉流拼 Blob 再保存
+async function blobDownload(url, filename, relay, setTxt) {
+  const mb = n => (n / 1048576).toFixed(1);
+  const resp = await fetch(url, {
+    referrerPolicy: 'no-referrer', credentials: 'omit', mode: 'cors', cache: 'no-store',
+  });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const total = Number(resp.headers.get('content-length') || 0);
+  let blob = null;
+  if (resp.body && resp.body.getReader) {
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let loaded = 0, tick = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.length;
+      const now = Date.now();
+      if (now - tick > 200) {
+        tick = now;
+        setTxt(total
+          ? `⏳ ${Math.floor(loaded / total * 100)}%  ${mb(loaded)}/${mb(total)}MB`
+          : `⏳ ${mb(loaded)}MB`);
+      }
+    }
+    blob = new Blob(chunks, { type: resp.headers.get('content-type') || 'application/octet-stream' });
+  } else {
+    blob = await resp.blob();
+  }
+  if (!blob.size) throw new Error('文件为空');
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { try { a.remove(); } catch (e) {} }, 600000);
+  setTimeout(() => URL.revokeObjectURL(objUrl), 600000);
 }
 
 async function directDownload(btn) {
   const url = decodeURIComponent(btn.dataset.url || '');
   const filename = decodeURIComponent(btn.dataset.name || 'download.mp4');
+  const relay = btn.dataset.relay || '';
   if (!url || btn.dataset.busy === '1') return;
 
   if (!btn.dataset.label) btn.dataset.label = btn.textContent.trim();
   btn.dataset.busy = '1';
   btn.disabled = true;
   const setTxt = t => { btn.textContent = t; };
-  const mb = n => (n / 1048576).toFixed(1);
 
   try {
-    const resp = await fetch(url, {
-      referrerPolicy: 'no-referrer',
-      credentials: 'omit',
-      mode: 'cors',
-      cache: 'no-store',
-    });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-
-    const total = Number(resp.headers.get('content-length') || 0);
-    let blob = null;
-
-    if (resp.body && resp.body.getReader) {
-      const reader = resp.body.getReader();
-      const chunks = [];
-      let loaded = 0, tick = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
-        const now = Date.now();
-        if (now - tick > 200) {
-          tick = now;
-          setTxt(total
-            ? `⏳ ${Math.floor(loaded / total * 100)}%  ${mb(loaded)}/${mb(total)}MB`
-            : `⏳ ${mb(loaded)}MB`);
-        }
-      }
-      blob = new Blob(chunks, { type: resp.headers.get('content-type') || 'application/octet-stream' });
+    const reg = await withTimeout(swReady, 4000);
+    if (reg) {
+      // 主路径：浏览器原生下载器接管（可暂停/续传、真实速度、自动命名）
+      triggerNativeDownload(url, filename, relay);
+      setTxt('✔ 已开始下载');
+      showTip('已交给浏览器下载，请查看浏览器<b>右上角下载条</b>（或按 <b>⌘/Ctrl + J</b>）。<br>文件名：<b>'
+        + filename + '</b>　若下载条显示失败，请点右侧「🛰 中转」。');
     } else {
-      blob = await resp.blob();
+      setTxt('⏳ 下载中…');
+      await blobDownload(url, filename, relay, setTxt);
+      setTxt('✔ 已保存');
+      clearError();
     }
-
-    if (!blob.size) throw new Error('文件为空');
-
-    const objUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = objUrl;
-    a.download = filename;          // 达人名 + 发布时间，由这里决定
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(objUrl), 120000);
-    setTxt('✔ 已保存');
-    clearError();
   } catch (e) {
-    const relay = btn.dataset.relay || '';
     if (relay) {
       setTxt('⚠ 转中转下载…');
       showError('直连被源站拒绝（' + e.message + '），已自动切换到「🛰 中转」下载，速度会慢一些属正常。');
@@ -1523,7 +1658,7 @@ async function directDownload(btn) {
     setTimeout(() => {
       btn.textContent = btn.dataset.label;
       btn.disabled = false;
-    }, 2200);
+    }, 4000);
   }
 }
 
@@ -1751,6 +1886,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", "inline")
             self.end_headers()
             self.wfile.write(HTML_PAGE.encode("utf-8"))
+
+        elif parsed.path == "/sw-dl.js":
+            body = SW_JS.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.send_header("Service-Worker-Allowed", "/")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(body)
+
+        elif parsed.path == "/__dl":
+            # 正常由 Service Worker 拦截并补 Content-Disposition；
+            # 若 SW 未生效（首次访问/隐私模式）就走服务端中转兜底。
+            qs = urllib.parse.parse_qs(parsed.query)
+            dl_url = qs.get("u", [""])[0]
+            filename = qs.get("n", ["video.mp4"])[0]
+            if not dl_url:
+                self.send_error(400, "Missing u")
+                return
+            platform = "xhs" if "xhscdn" in dl_url or "xiaohongshu" in dl_url else "douyin"
+            self._proxy_download(dl_url, filename, platform)
 
         elif parsed.path == "/api/download":
             qs = urllib.parse.parse_qs(parsed.query)
