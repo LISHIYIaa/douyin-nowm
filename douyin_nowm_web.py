@@ -81,7 +81,7 @@ def extract_url_from_text(text: str) -> str:
     urls = re.findall(r'https?://[^\s<>"\']+', text)
     if not urls:
         # 尝试匹配不带协议的域名 URL
-        urls = re.findall(r'(?:v\.douyin\.com|xhslink\.com|www\.xiaohongshu\.com|www\.douyin\.com|www\.iesdouyin\.com)/[^\s<>"\']+', text)
+        urls = re.findall(r'(?:v\.douyin\.com|xhslink\.com|xhslink\.cn|xhs\.cn|www\.xiaohongshu\.com|www\.douyin\.com|www\.iesdouyin\.com)/[^\s<>"\']+', text)
         if urls:
             return "https://" + urls[0]
         raise ValueError("未在输入文本中找到有效的链接")
@@ -96,12 +96,34 @@ def extract_url_from_text(text: str) -> str:
 
 # ── 平台检测 ──────────────────────────────────────────
 
+DOUYIN_HOSTS = ("douyin.com", "iesdouyin.com")
+XHS_HOSTS = ("xiaohongshu.com", "xhslink.com", "xhslink.cn", "xhs.cn")
+
+
+def url_host(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url).netloc.lower().split(":")[0]
+    except Exception:
+        return ""
+
+
+def host_matches(url: str, hosts) -> bool:
+    """按主机名后缀匹配，避免再漏掉新域名（如 xhslink.cn）。"""
+    host = url_host(url)
+    return bool(host) and any(host == h or host.endswith("." + h) for h in hosts)
+
+
 def detect_platform(url: str) -> str:
     """根据 URL 判断平台：douyin / xhs"""
-    lower = url.lower()
-    if any(k in lower for k in ["douyin.com", "iesdouyin.com", "v.douyin.com"]):
+    if host_matches(url, DOUYIN_HOSTS):
         return "douyin"
-    if any(k in lower for k in ["xiaohongshu.com", "xhslink.com", "xhs.cn"]):
+    if host_matches(url, XHS_HOSTS):
+        return "xhs"
+    # 兜底：无协议或带短链参数时按子串识别
+    lower = url.lower()
+    if any(k in lower for k in DOUYIN_HOSTS):
+        return "douyin"
+    if any(k in lower for k in XHS_HOSTS):
         return "xhs"
     raise ValueError("无法识别链接平台，目前支持抖音和小红书")
 
@@ -480,7 +502,7 @@ def process_douyin(share_url: str, quality: str = "default") -> dict:
 
 def xhs_resolve_share_url(share_url: str) -> str:
     """解析小红书短链接，返回最终页面 URL（保留 xsec_token 等查询参数）"""
-    if "xhslink.com" in share_url or "xhs.cn" in share_url:
+    if host_matches(share_url, ("xhslink.com", "xhslink.cn", "xhs.cn")):
         req = urllib.request.Request(share_url, headers={
             "User-Agent": MOBILE_UA,
             "Accept": "text/html",
@@ -498,7 +520,7 @@ def xhs_extract_note_id(url: str) -> str:
     match = re.search(r"/discovery/item/([a-f0-9]+)", url)
     if match:
         return match.group(1)
-    match = re.search(r"xhslink\.com/([A-Za-z0-9]+)", url)
+    match = re.search(r"xhslink\.(?:com|cn)/([A-Za-z0-9]+)", url)
     if match:
         return match.group(1)
     raise ValueError("无法从小红书链接提取笔记 ID")
