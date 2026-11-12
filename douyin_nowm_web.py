@@ -1571,15 +1571,12 @@ function attrEnc(s) {
   return encodeURIComponent(String(s || '')).replace(/'/g, '%27');
 }
 
-// SW 就绪 promise（拿不到就为 null，走下面的 Blob 兜底）
-const swReady = (function () {
-  if (!('serviceWorker' in navigator)) return Promise.resolve(null);
-  try {
-    return navigator.serviceWorker
-      .register('/sw-dl.js', { scope: '/' })
-      .then(() => navigator.serviceWorker.ready)
-      .catch(() => null);
-  } catch (e) { return Promise.resolve(null); }
+// 直链下载不再需要 Service Worker：顺手注销旧版本留下的 SW，避免被劫持变慢
+(function () {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.getRegistrations()
+    .then(rs => rs.forEach(r => r.unregister()))
+    .catch(() => {});
 })();
 
 function withTimeout(p, ms) {
@@ -1736,7 +1733,7 @@ async function parseLink() {
               <span class="img-dim">${img.width}x${img.height}</span>
               <span class="img-size">${img.file_size_human}</span>
             </div>
-            <button type="button" class="btn-img-download" data-url="${attrEnc(img.url)}" data-name="${attrEnc(imgName)}" onclick="directDownload(this)" title="点击即自动保存为「${imgName}」">⬇</button>
+            <a class="btn-img-download" href="${img.url}" target="_blank" rel="noopener noreferrer" title="浏览器直连 CDN 下载原图">⬇</a>
           </div>`;
       });
 
@@ -1786,15 +1783,15 @@ async function parseLink() {
       const datePart = safeName(data.pub_date);
       const filename = (safeName(data.author) || 'video') + (datePart ? '_' + datePart : '') + '.mp4';
 
-      // 直连是否可行由后端用「浏览器同款请求（桌面 UA、不带 Referer）」探测得出；
-      // 抖音 CDN 对带外部 Referer 的请求返回 403，此时主按钮自动切到中转。
+      // 直链下载：浏览器直接连源站 CDN（不经过本服务器、不经 Service Worker），
+      // 速度取决于你的宽带与 CDN 线路，通常是整条链路里最快的。
       const directOk = data.direct_ok !== false;
       const relayHref = `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`;
-      const directBtn = `<button type="button" class="btn-${directOk ? 'download' : 'direct'}" data-url="${attrEnc(data.download_url)}" data-name="${attrEnc(filename)}" data-relay="${attrEnc(relayHref)}" onclick="directDownload(this)" title="浏览器直连源站 CDN（速度最快），点击即自动保存为「${filename}」">⚡ 直连下载</button>`;
-      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，兼容性最好（直连 403/失败时用这个），同样自动命名为「${filename}」">🛰 中转</a>`;
+      const directBtn = `<a class="btn-${directOk ? 'download' : 'direct'}" href="${data.download_url}" target="_blank" rel="noopener noreferrer" title="浏览器直接连源站 CDN 下载（最快），不经过本服务器">⚡ 直链下载</a>`;
+      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，可自动命名为「${filename}」（直链打不开时用这个，速度受服务器带宽限制）">🛰 中转</a>`;
       const tipText = directOk
-        ? `⚡ 直连下载不经服务器中转，国内速度通常快 10 倍以上；点击后自动保存为「${filename}」。若提示失败请改用「🛰 中转」。`
-        : '该视频源站不允许浏览器直连（会返回 403），已默认走「🛰 中转」，速度受服务器带宽限制。也可点「⚡ 直连下载」自己试一次。';
+        ? `⚡ 「直链下载」由浏览器直接连源站 CDN，不经过本服务器，速度最快。<br><span style="opacity:.6">若点开后是在线播放（抖音常见），右键「存储视频为…」即可；需要自动命名为「${filename}」时用「🛰 中转」。</span>`
+        : '该视频源站对浏览器有校验，直链可能打不开，建议用「🛰 中转」（速度受服务器带宽限制）。';
 
       resultArea.innerHTML = `
         <div class="result-card">
