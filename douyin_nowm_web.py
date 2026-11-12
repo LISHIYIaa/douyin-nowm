@@ -1583,22 +1583,10 @@ function withTimeout(p, ms) {
   return Promise.race([p, new Promise(r => setTimeout(() => r(null), ms))]);
 }
 
-// 用同源 <a download> 触发；节点必须留在 DOM 里一小会儿，
-// 立刻 remove 会让部分 Chrome 版本把下载标记为「已取消」。
-function triggerNativeDownload(url, filename, relay) {
-  let q = '/__dl?u=' + encodeURIComponent(url) + '&n=' + encodeURIComponent(filename);
-  if (relay) q += '&f=' + encodeURIComponent(relay);
-  const a = document.createElement('a');
-  a.href = q;
-  a.download = filename;
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { try { a.remove(); } catch (e) {} }, 600000);
-}
-
-// 兜底：SW 不可用时，自己拉流拼 Blob 再保存
-async function blobDownload(url, filename, relay, setTxt) {
+// 浏览器直连源站 CDN 拉流 → Blob → 保存为指定文件名。
+// 数据仍然是浏览器直连源站 CDN（不经过服务器），只是由页面负责保存，
+// 这样才能把文件命名成「达人名_发布日期」。
+async function blobDownload(url, filename, setTxt) {
   const mb = n => (n / 1048576).toFixed(1);
   const resp = await fetch(url, {
     referrerPolicy: 'no-referrer', credentials: 'omit', mode: 'cors', cache: 'no-store',
@@ -1616,7 +1604,7 @@ async function blobDownload(url, filename, relay, setTxt) {
       chunks.push(value);
       loaded += value.length;
       const now = Date.now();
-      if (now - tick > 200) {
+      if (now - tick > 250) {
         tick = now;
         setTxt(total
           ? `⏳ ${Math.floor(loaded / total * 100)}%  ${mb(loaded)}/${mb(total)}MB`
@@ -1650,19 +1638,10 @@ async function directDownload(btn) {
   const setTxt = t => { btn.textContent = t; };
 
   try {
-    const reg = await withTimeout(swReady, 4000);
-    if (reg) {
-      // 主路径：浏览器原生下载器接管（可暂停/续传、真实速度、自动命名）
-      triggerNativeDownload(url, filename, relay);
-      setTxt('✔ 已开始下载');
-      showTip('已交给浏览器下载，请查看浏览器<b>右上角下载条</b>（或按 <b>⌘/Ctrl + J</b>）。<br>文件名：<b>'
-        + filename + '</b>　若下载条显示失败，请点右侧「🛰 中转」。');
-    } else {
-      setTxt('⏳ 下载中…');
-      await blobDownload(url, filename, relay, setTxt);
-      setTxt('✔ 已保存');
-      clearError();
-    }
+    setTxt('⏳ 连接源站…');
+    await blobDownload(url, filename, setTxt);
+    setTxt('✔ 已保存');
+    clearError();
   } catch (e) {
     if (relay) {
       setTxt('⚠ 转中转下载…');
@@ -1733,7 +1712,7 @@ async function parseLink() {
               <span class="img-dim">${img.width}x${img.height}</span>
               <span class="img-size">${img.file_size_human}</span>
             </div>
-            <a class="btn-img-download" href="${img.url}" target="_blank" rel="noopener noreferrer" title="浏览器直连 CDN 下载原图">⬇</a>
+            <button type="button" class="btn-img-download" data-url="${attrEnc(img.url)}" data-name="${attrEnc(imgName)}" onclick="directDownload(this)" title="浏览器直连下载，保存为「${imgName}」">⬇</button>
           </div>`;
       });
 
@@ -1783,15 +1762,14 @@ async function parseLink() {
       const datePart = safeName(data.pub_date);
       const filename = (safeName(data.author) || 'video') + (datePart ? '_' + datePart : '') + '.mp4';
 
-      // 直链下载：浏览器直接连源站 CDN（不经过本服务器、不经 Service Worker），
-      // 速度取决于你的宽带与 CDN 线路，通常是整条链路里最快的。
+      // 浏览器直连源站 CDN 拉流（不经服务器），保存时用自定义文件名
       const directOk = data.direct_ok !== false;
       const relayHref = `/api/download?url=${encodeURIComponent(data.download_url)}&platform=${data.platform}&filename=${encodeURIComponent(filename)}`;
-      const directBtn = `<a class="btn-${directOk ? 'download' : 'direct'}" href="${data.download_url}" target="_blank" rel="noopener noreferrer" title="浏览器直接连源站 CDN 下载（最快），不经过本服务器">⚡ 直链下载</a>`;
-      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，可自动命名为「${filename}」（直链打不开时用这个，速度受服务器带宽限制）">🛰 中转</a>`;
+      const directBtn = `<button type="button" class="btn-${directOk ? 'download' : 'direct'}" data-url="${attrEnc(data.download_url)}" data-name="${attrEnc(filename)}" data-relay="${attrEnc(relayHref)}" onclick="directDownload(this)" title="浏览器直连源站 CDN，点击即保存为「${filename}」">⚡ 直连下载</button>`;
+      const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，速度受服务器带宽限制（直连失败时用）">🛰 中转</a>`;
       const tipText = directOk
-        ? `⚡ 「直链下载」由浏览器直接连源站 CDN，不经过本服务器，速度最快。<br><span style="opacity:.6">若点开后是在线播放（抖音常见），右键「存储视频为…」即可；需要自动命名为「${filename}」时用「🛰 中转」。</span>`
-        : '该视频源站对浏览器有校验，直链可能打不开，建议用「🛰 中转」（速度受服务器带宽限制）。';
+        ? `⚡ 直连下载：浏览器直接从源站 CDN 拉流（不经本服务器），保存为「${filename}」。进度显示在按钮上，下载完成浏览器会自动保存。`
+        : '该视频源站不允许浏览器直连，已默认走「🛰 中转」，速度受服务器带宽限制。';
 
       resultArea.innerHTML = `
         <div class="result-card">
