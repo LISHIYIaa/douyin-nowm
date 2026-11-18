@@ -643,8 +643,14 @@ def xhs_extract_note_info(initial_state: dict, note_id: str) -> dict:
         # 统一转 HTTPS
         download_url = download_url.replace("http://", "https://")
 
+        # 作者上传的原始视频（无水印、原画质）。转码流是加了水印的分享版本，
+        # 有 originVideoKey 时优先用原始视频。
+        ori_key = (video.get("consumer") or {}).get("originVideoKey", "")
+        ori_url = f"https://sns-video-hw.xhscdn.com/{ori_key}" if ori_key else ""
+
         base.update({
             "download_url": download_url,
+            "ori_url": ori_url,
             "backup_urls": backup_urls,
             "width": best_stream.get("width", 0),
             "height": best_stream.get("height", 0),
@@ -732,8 +738,15 @@ def process_xhs(share_url: str) -> dict:
         raise ValueError("未能获取小红书笔记数据，链接中的 xsec_token 可能已过期，请重新分享获取新链接")
 
     if info["note_type"] == "video":
-        probe = xhs_probe_url(info["download_url"])
-        direct_ok, direct_len, direct_ctype = probe_browser_direct(info["download_url"])
+        # 优先用作者上传的原始视频（无水印、原画质）；不可用时退回带水印的转码流
+        chosen_url = info["download_url"]
+        ori_url = info.get("ori_url") or ""
+        if ori_url:
+            ok_ori, len_ori, ct_ori = probe_browser_direct(ori_url)
+            if ok_ori and len_ori > 0:
+                chosen_url = ori_url
+        probe = xhs_probe_url(chosen_url)
+        direct_ok, direct_len, direct_ctype = probe_browser_direct(chosen_url)
         return {
             "platform": "xhs",
             "ok": True,
@@ -749,7 +762,10 @@ def process_xhs(share_url: str) -> dict:
             "collected_count": info["collected_count"],
             "cover_url": info["cover_url"],
             "pub_date": info["pub_date"],
-            "download_url": info["download_url"],
+            "download_url": chosen_url,
+            "ori_url": ori_url,
+            "stream_url": info["download_url"],
+            "watermark_free": bool(ori_url and chosen_url == ori_url),
             "file_size": probe["content_length"] or direct_len,
             "file_size_human": format_size(probe["content_length"] or direct_len),
             "content_type": probe["content_type"] or direct_ctype,
@@ -1695,7 +1711,9 @@ async function parseLink() {
     const badge = isXHS
       ? (isImage
         ? `<span style="color:var(--green)">● 原图高清</span>`
-        : `<span style="color:var(--green)">● 原始高清</span>`)
+        : (data.watermark_free
+          ? `<span style="color:var(--green)">● 无水印原画</span>`
+          : `<span style="color:#e6a23c">● 转码流（可能含水印）</span>`))
       : (quality === 'default'
         ? `<span style="color:var(--green)">● 原始高清</span>`
         : `<span style="color:var(--text-dim)">● 720P 压缩</span>`);
@@ -1768,7 +1786,9 @@ async function parseLink() {
       const directBtn = `<button type="button" class="btn-${directOk ? 'download' : 'direct'}" data-url="${attrEnc(data.download_url)}" data-name="${attrEnc(filename)}" data-relay="${attrEnc(relayHref)}" onclick="directDownload(this)" title="浏览器直连源站 CDN，点击即保存为「${filename}」">⚡ 直连下载</button>`;
       const relayBtn = `<a class="btn-${directOk ? 'direct' : 'download'}" href="${relayHref}" title="经服务器中转下载，速度受服务器带宽限制（直连失败时用）">🛰 中转</a>`;
       const tipText = directOk
-        ? `⚡ 直连下载：浏览器直接从源站 CDN 拉流（不经本服务器），保存为「${filename}」。进度显示在按钮上，下载完成浏览器会自动保存。`
+        ? (data.watermark_free
+          ? `⚡ 直连下载：已自动选用<b>无水印原画</b>（作者上传的原始视频，${data.file_size_human}），保存为「${filename}」。`
+          : `⚡ 直连下载：浏览器直接从源站 CDN 拉流（不经本服务器），保存为「${filename}」。`)
         : '该视频源站不允许浏览器直连，已默认走「🛰 中转」，速度受服务器带宽限制。';
 
       resultArea.innerHTML = `
